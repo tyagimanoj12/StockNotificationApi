@@ -1,6 +1,6 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
-using StockNotificationApi.Services;
 
 namespace StockNotificationApi.Controllers
 {

@@ -1,5 +1,6 @@
 ﻿using Microsoft.Extensions.Options;
 using Quartz;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 
 namespace StockNotificationApi.Services

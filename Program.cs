@@ -1,4 +1,5 @@
 using Quartz;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using StockNotificationApi.Services;
 
@@ -9,22 +10,53 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// Configure HttpClient
-builder.Services.AddHttpClient<IStockService, StockService>(client =>
+// Add HTTP client factory FIRST
+builder.Services.AddHttpClient();
+
+// Configure HttpClients with named clients if needed
+builder.Services.AddHttpClient("StockClient", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
     client.DefaultRequestHeaders.Add("Accept", "application/json");
 });
 
-builder.Services.AddHttpClient<IAIService, GeminiAIService>(client =>
+builder.Services.AddHttpClient("GeminiClient", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(60);
     client.DefaultRequestHeaders.Add("Accept", "application/json");
 });
 
-// Register services
+// Register the CONCRETE StockService FIRST
+builder.Services.AddScoped<StockService>();
+
+// Register IStockService interface with the concrete implementation
 builder.Services.AddScoped<IStockService, StockService>();
-builder.Services.AddScoped<IAIService, GeminiAIService>();
+
+// NOW apply decoration (only use ONE of these approaches)
+
+// OPTION A: Using Scrutor (if you have Scrutor installed)
+builder.Services.Decorate<IStockService, FallbackStockService>();
+
+// OPTION B: Manual factory (comment out OPTION A if using this)
+// builder.Services.AddScoped<IStockService>(serviceProvider =>
+// {
+//     var primaryService = serviceProvider.GetRequiredService<StockService>();
+//     var httpClientFactory = serviceProvider.GetRequiredService<IHttpClientFactory>();
+//     var configuration = serviceProvider.GetRequiredService<IConfiguration>();
+//     var logger = serviceProvider.GetRequiredService<ILogger<FallbackStockService>>();
+//
+//     return new FallbackStockService(
+//         primaryService,
+//         httpClientFactory,
+//         configuration,
+//         logger);
+// });
+
+// Register AI service - CHOOSE ONLY ONE
+builder.Services.AddScoped<IAIService, EnhancedAIService>(); // Using Enhanced version
+// builder.Services.AddScoped<IAIService, GeminiAIService>(); // OR original Gemini
+
+// Register notification service
 builder.Services.AddScoped<INotificationService, EmailNotificationService>();
 
 // Configure Quartz for background jobs

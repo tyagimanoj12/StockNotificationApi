@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
 

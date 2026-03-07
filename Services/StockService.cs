@@ -1,6 +1,7 @@
 ﻿using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 
 namespace StockNotificationApi.Services
@@ -50,6 +51,7 @@ namespace StockNotificationApi.Services
             return stockDataList;
         }
 
+        // Services/StockService.cs - Update the GetStockDataAsync method
         public async Task<StockData?> GetStockDataAsync(string symbol)
         {
             try
@@ -69,18 +71,33 @@ namespace StockNotificationApi.Services
                     return null;
                 }
 
+                // Parse change percent
+                var changePercentStr = globalQuote["10. change percent"]?.ToString().Replace("%", "") ?? "0";
+                decimal changePercent = 0;
+                decimal.TryParse(changePercentStr, out changePercent);
+
                 var stockData = new StockData
                 {
-                    Symbol = symbol.Replace(".BSE", ""),
+                    Symbol = symbol.Replace(".BSE", "").Replace(".NSE", ""),
                     Name = GetCompanyName(symbol),
-                    Price = decimal.Parse(globalQuote["05. price"]?.ToString() ?? "0"),
-                    Change = decimal.Parse(globalQuote["09. change"]?.ToString() ?? "0"),
-                    ChangePercent = decimal.Parse(globalQuote["10. change percent"]?.ToString().Replace("%", "") ?? "0"),
-                    DayHigh = decimal.Parse(globalQuote["03. high"]?.ToString() ?? "0"),
-                    DayLow = decimal.Parse(globalQuote["04. low"]?.ToString() ?? "0"),
-                    Volume = long.Parse(globalQuote["06. volume"]?.ToString() ?? "0"),
-                    Timestamp = DateTime.Parse(globalQuote["07. latest trading day"]?.ToString() ?? DateTime.Now.ToString()),
-                    Exchange = symbol.Contains(".BSE") ? "BSE" : "NSE"
+                    Price = decimal.TryParse(globalQuote["05. price"]?.ToString(), out var price) ? price : 0,
+                    Change = decimal.TryParse(globalQuote["09. change"]?.ToString(), out var change) ? change : 0,
+                    ChangePercent = changePercent,
+                    DayHigh = decimal.TryParse(globalQuote["03. high"]?.ToString(), out var high) ? high : 0,
+                    DayLow = decimal.TryParse(globalQuote["04. low"]?.ToString(), out var low) ? low : 0,
+                    Volume = long.TryParse(globalQuote["06. volume"]?.ToString(), out var volume) ? volume : 0,
+                    Timestamp = DateTime.TryParse(globalQuote["07. latest trading day"]?.ToString(), out var timestamp) ? timestamp : DateTime.Now,
+                    Exchange = symbol.Contains(".BSE") ? "BSE" : "NSE",
+
+                    // Initialize new properties with defaults or calculate them
+                    YearHigh = decimal.TryParse(globalQuote["03. high"]?.ToString(), out var yearHigh) ? yearHigh * 1.2m : price * 1.2m, // Approximate if not available
+                    YearLow = decimal.TryParse(globalQuote["04. low"]?.ToString(), out var yearLow) ? yearLow * 0.8m : price * 0.8m,
+                    Open = decimal.TryParse(globalQuote["02. open"]?.ToString(), out var open) ? open : price,
+                    PreviousClose = decimal.TryParse(globalQuote["08. previous close"]?.ToString(), out var prevClose) ? prevClose : price,
+                    PE = null, // Alpha Vantage doesn't provide PE in this endpoint
+                    MarketCap = 0, // Would need another endpoint
+                    Sector = GetSector(symbol),
+                    Industry = GetIndustry(symbol)
                 };
 
                 return stockData;
@@ -92,6 +109,46 @@ namespace StockNotificationApi.Services
             }
         }
 
+        // Add helper methods
+        private string GetSector(string symbol)
+        {
+            var sectors = new Dictionary<string, string>
+            {
+                ["RELIANCE"] = "Energy",
+                ["TCS"] = "Technology",
+                ["HDFCBANK"] = "Banking",
+                ["INFY"] = "Technology",
+                ["ICICIBANK"] = "Banking",
+                ["HINDUNILVR"] = "FMCG",
+                ["ITC"] = "FMCG",
+                ["SBIN"] = "Banking",
+                ["BHARTIARTL"] = "Telecom",
+                ["KOTAKBANK"] = "Banking"
+            };
+
+            var key = symbol.Replace(".BSE", "").Replace(".NSE", "");
+            return sectors.ContainsKey(key) ? sectors[key] : "Other";
+        }
+
+        private string GetIndustry(string symbol)
+        {
+            var industries = new Dictionary<string, string>
+            {
+                ["RELIANCE"] = "Oil & Gas",
+                ["TCS"] = "IT Services",
+                ["HDFCBANK"] = "Private Bank",
+                ["INFY"] = "IT Services",
+                ["ICICIBANK"] = "Private Bank",
+                ["HINDUNILVR"] = "Consumer Goods",
+                ["ITC"] = "Diversified",
+                ["SBIN"] = "Public Bank",
+                ["BHARTIARTL"] = "Telecom",
+                ["KOTAKBANK"] = "Private Bank"
+            };
+
+            var key = symbol.Replace(".BSE", "").Replace(".NSE", "");
+            return industries.ContainsKey(key) ? industries[key] : "General";
+        }
         private string GetCompanyName(string symbol)
         {
             // Simplified company name mapping

@@ -1,4 +1,5 @@
-﻿namespace StockNotificationApi.Models
+﻿// Models/StockData.cs
+namespace StockNotificationApi.Models
 {
     public class StockData
     {
@@ -11,7 +12,20 @@
         public decimal DayLow { get; set; }
         public long Volume { get; set; }
         public DateTime Timestamp { get; set; }
+        public string? Isin { get; set; }
+
         public string Exchange { get; set; } = "BSE";
+
+        // Add missing properties
+        public decimal YearHigh { get; set; }
+        public decimal YearLow { get; set; }
+        public decimal Open { get; set; }
+        public decimal PreviousClose { get; set; }
+        public decimal? PE { get; set; }
+        public decimal MarketCap { get; set; }
+        public decimal FaceValue { get; set; }
+        public string Sector { get; set; } = string.Empty;
+        public string Industry { get; set; } = string.Empty;
     }
 
     public class AlphaVantageResponse

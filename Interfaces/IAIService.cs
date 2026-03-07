@@ -1,6 +1,6 @@
 ﻿using StockNotificationApi.Models;
 
-namespace StockNotificationApi.Services
+namespace StockNotificationApi.Interfaces
 {
     public interface IAIService
     {

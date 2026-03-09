@@ -36,8 +36,41 @@ namespace StockNotificationApi.Services
 
         public async Task<List<StockData>> GetIndianStockDataAsync()
         {
+            _logger.LogInformation("FallbackService.GetIndianStockDataAsync called");
+
+            // STEP 1: ALWAYS try the primary service first (your StockService)
+            try
+            {
+                _logger.LogInformation("Attempting to get stock list from primary service (StockService)");
+                var stocks = await _primaryService.GetIndianStockDataAsync();
+
+                if (stocks != null && stocks.Any())
+                {
+                    _logger.LogInformation("Primary service returned {Count} stocks successfully", stocks.Count);
+                    return stocks;
+                }
+
+                _logger.LogWarning("Primary service returned no stocks");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Primary service failed to get stock list");
+
+                // Check if it's a rate limit issue
+                if (ex.Message.Contains("rate limit") || ex.Message.Contains("25 requests"))
+                {
+                    MarkApiRateLimited("AlphaVantage", ALPHA_VANTAGE_COOLDOWN);
+                }
+            }
+
+            // STEP 2: If primary fails, use fallback symbols from configuration
+            _logger.LogInformation("Primary service failed, using fallback symbols from configuration");
+
             var symbols = _configuration.GetSection("StockApiSettings:IndianStocks").Get<List<string>>()
-                ?? new List<string> { "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS" };
+                ?? new List<string> {
+            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+            "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS"
+                };
 
             var results = new List<StockData>();
 
@@ -45,7 +78,8 @@ namespace StockNotificationApi.Services
             {
                 try
                 {
-                    var stock = await GetStockDataAsync(symbol);
+                    _logger.LogDebug("Fetching {Symbol} via fallback APIs", symbol);
+                    var stock = await GetStockDataAsync(symbol); // This calls your individual stock fallback logic
                     if (stock != null)
                     {
                         results.Add(stock);
@@ -54,12 +88,39 @@ namespace StockNotificationApi.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error fetching {Symbol}", symbol);
+                    _logger.LogError(ex, "Error fetching {Symbol} in fallback", symbol);
                 }
             }
 
+            _logger.LogInformation("Fallback service returning {Count} stocks from fallback APIs", results.Count);
             return results;
         }
+        //public async Task<List<StockData>> GetIndianStockDataAsync()
+        //{
+        //    var symbols = _configuration.GetSection("StockApiSettings:IndianStocks").Get<List<string>>()
+        //        ?? new List<string> { "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS" };
+
+        //    var results = new List<StockData>();
+
+        //    foreach (var symbol in symbols)
+        //    {
+        //        try
+        //        {
+        //            var stock = await GetStockDataAsync(symbol);
+        //            if (stock != null)
+        //            {
+        //                results.Add(stock);
+        //            }
+        //            await Task.Delay(500); // Be respectful to APIs
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            _logger.LogError(ex, "Error fetching {Symbol}", symbol);
+        //        }
+        //    }
+
+        //    return results;
+        //}
 
         public async Task<StockData?> GetStockDataAsync(string symbol)
         {
@@ -517,251 +578,5 @@ namespace StockNotificationApi.Services
         }
 
         #endregion
-    }
-
-    #region Rate Limit Model
-
-    public class RateLimitInfo
-    {
-        public string ApiName { get; set; } = string.Empty;
-        public DateTime CooldownUntil { get; set; }
-        public DateTime LastFailureTime { get; set; }
-        public int FailureCount { get; set; }
-    }
-
-    #endregion
-
-    #region NSE Response Models
-
-    public class NSEQuoteResponse
-    {
-        [JsonPropertyName("info")]
-        public NSEInfo? Info { get; set; }
-
-        [JsonPropertyName("metadata")]
-        public NSEMetadata? Metadata { get; set; }
-
-        [JsonPropertyName("priceInfo")]
-        public NSEPriceInfo? PriceInfo { get; set; }
-
-        [JsonPropertyName("industryInfo")]
-        public NSEIndustryInfo? IndustryInfo { get; set; }
-    }
-
-    public class NSEInfo
-    {
-        [JsonPropertyName("symbol")]
-        public string? Symbol { get; set; }
-
-        [JsonPropertyName("companyName")]
-        public string? CompanyName { get; set; }
-
-        [JsonPropertyName("isin")]
-        public string? Isin { get; set; }
-
-        [JsonPropertyName("industry")]
-        public string? Industry { get; set; }
-
-        [JsonPropertyName("isFNOSec")]
-        public bool IsFNOSec { get; set; }
-    }
-
-    public class NSEMetadata
-    {
-        [JsonPropertyName("symbol")]
-        public string? Symbol { get; set; }
-
-        [JsonPropertyName("isin")]
-        public string? Isin { get; set; }
-
-        [JsonPropertyName("lastUpdateTime")]
-        public string? LastUpdateTime { get; set; }
-
-        [JsonPropertyName("pdSymbolPe")]
-        public decimal? PdSymbolPe { get; set; }
-
-        [JsonPropertyName("pdSectorPe")]
-        public decimal? PdSectorPe { get; set; }
-    }
-
-    public class NSEPriceInfo
-    {
-        [JsonPropertyName("lastPrice")]
-        public decimal LastPrice { get; set; }
-
-        [JsonPropertyName("change")]
-        public decimal Change { get; set; }
-
-        [JsonPropertyName("pChange")]
-        public decimal PChange { get; set; }
-
-        [JsonPropertyName("previousClose")]
-        public decimal PreviousClose { get; set; }
-
-        [JsonPropertyName("open")]
-        public decimal Open { get; set; }
-
-        [JsonPropertyName("close")]
-        public decimal Close { get; set; }
-
-        [JsonPropertyName("vwap")]
-        public decimal Vwap { get; set; }
-
-        [JsonPropertyName("intraDayHighLow")]
-        public NSEIntraDayHighLow? IntraDayHighLow { get; set; }
-
-        [JsonPropertyName("weekHighLow")]
-        public NSEWeekHighLow? WeekHighLow { get; set; }
-
-        [JsonPropertyName("tickSize")]
-        public decimal TickSize { get; set; }
-    }
-
-    public class NSEIntraDayHighLow
-    {
-        [JsonPropertyName("min")]
-        public decimal Min { get; set; }
-
-        [JsonPropertyName("max")]
-        public decimal Max { get; set; }
-
-        [JsonPropertyName("value")]
-        public decimal Value { get; set; }
-    }
-
-    public class NSEWeekHighLow
-    {
-        [JsonPropertyName("min")]
-        public decimal Min { get; set; }
-
-        [JsonPropertyName("minDate")]
-        public string? MinDate { get; set; }
-
-        [JsonPropertyName("max")]
-        public decimal Max { get; set; }
-
-        [JsonPropertyName("maxDate")]
-        public string? MaxDate { get; set; }
-
-        [JsonPropertyName("value")]
-        public decimal Value { get; set; }
-    }
-
-    public class NSEIndustryInfo
-    {
-        [JsonPropertyName("macro")]
-        public string? Macro { get; set; }
-
-        [JsonPropertyName("sector")]
-        public string? Sector { get; set; }
-
-        [JsonPropertyName("industry")]
-        public string? Industry { get; set; }
-
-        [JsonPropertyName("basicIndustry")]
-        public string? BasicIndustry { get; set; }
-    }
-
-    #endregion
-
-    #region BSE Response Models
-
-    public class BSEQuoteResponse
-    {
-        [JsonPropertyName("scrip_code")]
-        public string? ScripCode { get; set; }
-
-        [JsonPropertyName("company_name")]
-        public string? CompanyName { get; set; }
-
-        [JsonPropertyName("current_price")]
-        public decimal CurrentPrice { get; set; }
-
-        [JsonPropertyName("change")]
-        public decimal Change { get; set; }
-
-        [JsonPropertyName("percentage_change")]
-        public decimal PercentChange { get; set; }
-
-        [JsonPropertyName("open")]
-        public decimal Open { get; set; }
-
-        [JsonPropertyName("day_high")]
-        public decimal DayHigh { get; set; }
-
-        [JsonPropertyName("day_low")]
-        public decimal DayLow { get; set; }
-
-        [JsonPropertyName("prev_close")]
-        public decimal PreviousClose { get; set; }
-
-        [JsonPropertyName("total_traded_volume")]
-        public long Volume { get; set; }
-
-        [JsonPropertyName("high_52")]
-        public decimal YearHigh { get; set; }
-
-        [JsonPropertyName("low_52")]
-        public decimal YearLow { get; set; }
-
-        [JsonPropertyName("pe")]
-        public decimal? PE { get; set; }
-
-        [JsonPropertyName("market_capitalisation")]
-        public decimal MarketCap { get; set; }
-
-        [JsonPropertyName("face_value")]
-        public decimal FaceValue { get; set; }
-
-        [JsonPropertyName("industry")]
-        public string? Industry { get; set; }
-
-        [JsonPropertyName("updated_at")]
-        public DateTime UpdatedAt { get; set; }
-    }
-
-    #endregion
-
-    #region Yahoo Finance Response Models
-
-    public class YahooFinanceResponse
-    {
-        [JsonPropertyName("chart")]
-        public YahooChart? Chart { get; set; }
-    }
-
-    public class YahooChart
-    {
-        [JsonPropertyName("result")]
-        public List<YahooResult>? Result { get; set; }
-    }
-
-    public class YahooResult
-    {
-        [JsonPropertyName("meta")]
-        public YahooMeta? Meta { get; set; }
-    }
-
-    public class YahooMeta
-    {
-        [JsonPropertyName("regularMarketPrice")]
-        public decimal? RegularMarketPrice { get; set; }
-
-        [JsonPropertyName("previousClose")]
-        public decimal? PreviousClose { get; set; }
-
-        [JsonPropertyName("regularMarketDayHigh")]
-        public decimal? RegularMarketDayHigh { get; set; }
-
-        [JsonPropertyName("regularMarketDayLow")]
-        public decimal? RegularMarketDayLow { get; set; }
-
-        [JsonPropertyName("regularMarketOpen")]
-        public decimal? RegularMarketOpen { get; set; }
-
-        [JsonPropertyName("regularMarketVolume")]
-        public long? RegularMarketVolume { get; set; }
-    }
-
-    #endregion
+    }    
 }

@@ -1,8 +1,8 @@
-﻿// Services/EnhancedMarketAnalysisService.cs
-using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
 using System.Text.Json;
+using System.Linq; // Add this
 
 namespace StockNotificationApi.Services
 {
@@ -37,22 +37,37 @@ namespace StockNotificationApi.Services
 
             var analysis = new EnhancedMarketAnalysis
             {
-                AnalysisDate = DateTime.Now
+                AnalysisDate = DateTime.Now,
+                LargeCap = new CategoryAnalysis { Category = "Large Cap" },
+                MidCap = new CategoryAnalysis { Category = "Mid Cap" },
+                SmallCap = new CategoryAnalysis { Category = "Small Cap" },
+                KeyNewsImpacts = new List<NewsImpactAnalysis>(),
+                TechnicalIndicators = new TechnicalSummary()
             };
 
             try
             {
-                // Get all stocks
-                var allStocks = await _stockService.GetIndianStockDataAsync();
+                // Get categorized stocks directly from StockListService
+                var categories = await _stockListService.GetAllCategoriesAsync();
 
-                // Get historical data (last 10 days)
+                _logger.LogInformation($"Categories - Large: {categories["LargeCap"].Count}, " +
+                                      $"Mid: {categories["MidCap"].Count}, " +
+                                      $"Small: {categories["SmallCap"].Count}");
+
+                // Convert StockInfo to StockData for each category (take top 30 from each)
+                var largeCapStocks = await ConvertToStockData(categories["LargeCap"].Take(30).ToList());
+                var midCapStocks = await ConvertToStockData(categories["MidCap"].Take(30).ToList());
+                var smallCapStocks = await ConvertToStockData(categories["SmallCap"].Take(30).ToList());
+
+                _logger.LogInformation($"Converted - Large: {largeCapStocks.Count}, Mid: {midCapStocks.Count}, Small: {smallCapStocks.Count}");
+
+                var categorized = (largeCapStocks, midCapStocks, smallCapStocks);
+
+                // Get historical data
                 var historicalData = await GetHistoricalDataAsync();
 
                 // Get recent news
                 var recentNews = await _newsService.GetTopMarketNewsAsync(20);
-
-                // Categorize stocks by market cap
-                var categorized = await CategorizeStocksAsync(allStocks);
 
                 // Build comprehensive prompt for AI
                 var prompt = BuildAnalysisPrompt(historicalData, categorized, recentNews);
@@ -63,21 +78,787 @@ namespace StockNotificationApi.Services
                 // Parse AI response into structured data
                 analysis = ParseAIResponse(aiResponse, categorized);
 
+                // ENSURE WE HAVE MARKET PHASE AND SENTIMENT
+                if (string.IsNullOrEmpty(analysis.MarketPhase))
+                {
+                    analysis.MarketPhase = DetermineMarketPhase(categorized);
+                }
+
+                if (string.IsNullOrEmpty(analysis.OverallSentiment))
+                {
+                    analysis.OverallSentiment = DetermineOverallSentiment(categorized);
+                }
+
+                // 🔥 DYNAMIC CONFIDENCE SCORE CALCULATION
+                analysis.ConfidenceScore = CalculateConfidenceScore(categorized, analysis.MarketPhase, analysis.OverallSentiment);
+
+                _logger.LogInformation($"Calculated confidence score: {analysis.ConfidenceScore}%");
+
+                // ENSURE WE HAVE ENOUGH PICKS PER CATEGORY
+                // Large Cap - need 5 picks
+                if (!analysis.LargeCap.TopPicks.Any())
+                {
+                    analysis.LargeCap.TopPicks = GenerateFallbackPicks(largeCapStocks, "Large");
+                }
+                else if (analysis.LargeCap.TopPicks.Count < 5)
+                {
+                    var existingSymbols = analysis.LargeCap.TopPicks.Select(p => p.Symbol).ToHashSet();
+                    var additionalPicks = GenerateFallbackPicks(largeCapStocks, "Large")
+                        .Where(p => !existingSymbols.Contains(p.Symbol))
+                        .Take(5 - analysis.LargeCap.TopPicks.Count);
+                    analysis.LargeCap.TopPicks.AddRange(additionalPicks);
+                }
+
+                // Mid Cap - need 3 picks
+                if (!analysis.MidCap.TopPicks.Any())
+                {
+                    analysis.MidCap.TopPicks = GenerateFallbackPicks(midCapStocks, "Mid");
+                }
+                else if (analysis.MidCap.TopPicks.Count < 3)
+                {
+                    var existingSymbols = analysis.MidCap.TopPicks.Select(p => p.Symbol).ToHashSet();
+                    var additionalPicks = GenerateFallbackPicks(midCapStocks, "Mid")
+                        .Where(p => !existingSymbols.Contains(p.Symbol))
+                        .Take(3 - analysis.MidCap.TopPicks.Count);
+                    analysis.MidCap.TopPicks.AddRange(additionalPicks);
+                }
+
+                // Small Cap - need 3 picks
+                if (!analysis.SmallCap.TopPicks.Any())
+                {
+                    analysis.SmallCap.TopPicks = GenerateFallbackPicks(smallCapStocks, "Small");
+                }
+                else if (analysis.SmallCap.TopPicks.Count < 3)
+                {
+                    var existingSymbols = analysis.SmallCap.TopPicks.Select(p => p.Symbol).ToHashSet();
+                    var additionalPicks = GenerateFallbackPicks(smallCapStocks, "Small")
+                        .Where(p => !existingSymbols.Contains(p.Symbol))
+                        .Take(3 - analysis.SmallCap.TopPicks.Count);
+                    analysis.SmallCap.TopPicks.AddRange(additionalPicks);
+                }
+
+                // Remove duplicates across categories
+                var allPicks = new HashSet<string>();
+
+                if (analysis.LargeCap.TopPicks.Any())
+                {
+                    analysis.LargeCap.TopPicks = analysis.LargeCap.TopPicks
+                        .Where(p => allPicks.Add(p.Symbol))
+                        .ToList();
+                }
+
+                if (analysis.MidCap.TopPicks.Any())
+                {
+                    analysis.MidCap.TopPicks = analysis.MidCap.TopPicks
+                        .Where(p => allPicks.Add(p.Symbol))
+                        .ToList();
+                }
+
+                if (analysis.SmallCap.TopPicks.Any())
+                {
+                    analysis.SmallCap.TopPicks = analysis.SmallCap.TopPicks
+                        .Where(p => allPicks.Add(p.Symbol))
+                        .ToList();
+                }
+
+                _logger.LogInformation($"After deduplication - Large: {analysis.LargeCap.TopPicks.Count}, " +
+                                      $"Mid: {analysis.MidCap.TopPicks.Count}, Small: {analysis.SmallCap.TopPicks.Count}");
+
                 // Add technical indicators
                 analysis.TechnicalIndicators = await CalculateTechnicalIndicatorsAsync(categorized);
 
                 // Add news impact analysis
                 analysis.KeyNewsImpacts = await AnalyzeNewsImpact(recentNews, categorized);
 
-                _logger.LogInformation("Enhanced market analysis completed successfully");
+                _logger.LogInformation($"Final analysis complete");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in enhanced market analysis");
+                return GetFallbackAnalysis();
             }
 
             return analysis;
         }
+
+        /// <summary>
+        /// Calculates a dynamic confidence score based on market conditions
+        /// </summary>
+
+        private int CalculateConfidenceScore(
+    (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized,
+    string marketPhase,
+    string sentiment)
+        {
+            try
+            {
+                var allStocks = categorized.LargeCap.Concat(categorized.MidCap).Concat(categorized.SmallCap).ToList();
+
+                if (!allStocks.Any()) return 70;
+
+                // Market Breadth - convert to decimal
+                var advances = allStocks.Count(s => s.ChangePercent > 0);
+                var declines = allStocks.Count(s => s.ChangePercent < 0);
+                var total = advances + declines;
+
+                decimal breadthScore = total > 0 ? (decimal)advances / total * 100m : 50m;
+
+                // Average Change
+                var avgChange = allStocks.Average(s => s.ChangePercent);
+                var changeScore = 50m + (avgChange * 15m);
+                changeScore = Math.Max(0, Math.Min(100, changeScore));
+
+                // Volatility
+                var changes = allStocks.Select(s => s.ChangePercent).ToList();
+                var volatility = CalculateStandardDeviationDecimal(changes);
+                var volatilityScore = 80m - (volatility * 20m);
+                volatilityScore = Math.Max(30, Math.Min(90, volatilityScore));
+
+                // Phase Alignment
+                var phaseScore = GetPhaseConfidenceDecimal(marketPhase, sentiment);
+
+                // Weighted average
+                var confidence = (breadthScore * 0.3m) + (changeScore * 0.3m) + (volatilityScore * 0.2m) + (phaseScore * 0.2m);
+
+                return (int)Math.Round(confidence);
+            }
+            catch
+            {
+                return 70;
+            }
+        }
+
+        private decimal CalculateStandardDeviationDecimal(List<decimal> values)
+        {
+            if (values.Count == 0) return 0;
+
+            var avg = values.Average();
+            var sum = values.Sum(v => (v - avg) * (v - avg));
+            return (decimal)Math.Sqrt((double)(sum / values.Count));
+        }
+
+        private decimal GetPhaseConfidenceDecimal(string marketPhase, string sentiment)
+        {
+            if (marketPhase.Contains("Bull") && sentiment.Contains("Bull"))
+                return 90m;
+            if (marketPhase.Contains("Bear") && sentiment.Contains("Bear"))
+                return 85m;
+            if (marketPhase.Contains("Bull") && sentiment.Contains("Neutral"))
+                return 70m;
+            if (marketPhase.Contains("Bear") && sentiment.Contains("Neutral"))
+                return 65m;
+            if (marketPhase.Contains("Consolidation") && sentiment.Contains("Neutral"))
+                return 75m;
+            return 60m;
+        }
+
+
+        /// <summary>
+        /// Get confidence based on market phase and sentiment alignment
+        /// </summary>
+        private double GetPhaseConfidence(string marketPhase, string sentiment)
+        {
+            // Higher confidence when market phase and sentiment align
+            if (marketPhase.Contains("Bull") && sentiment.Contains("Bull"))
+                return 90;
+            if (marketPhase.Contains("Bear") && sentiment.Contains("Bear"))
+                return 85;
+            if (marketPhase.Contains("Bull") && sentiment.Contains("Neutral"))
+                return 70;
+            if (marketPhase.Contains("Bear") && sentiment.Contains("Neutral"))
+                return 65;
+            if (marketPhase.Contains("Consolidation") && sentiment.Contains("Neutral"))
+                return 75;
+
+            // Mixed signals = lower confidence
+            return 60;
+        }
+
+        /// <summary>
+        /// Calculate standard deviation for a list of values
+        /// </summary>
+        private decimal CalculateStandardDeviation(List<decimal> values)
+        {
+            if (values.Count == 0) return 0;
+
+            var avg = values.Average();
+            var sum = values.Sum(v => (v - avg) * (v - avg));
+            return (decimal)Math.Sqrt((double)(sum / values.Count));
+        }
+
+
+        #region Market Phase Helpers
+
+        private string DetermineMarketPhase((List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
+        {
+            try
+            {
+                var allStocks = categorized.LargeCap.Concat(categorized.MidCap).Concat(categorized.SmallCap).ToList();
+                if (!allStocks.Any()) return "Consolidation";
+
+                var advances = allStocks.Count(s => s.ChangePercent > 0);
+                var declines = allStocks.Count(s => s.ChangePercent < 0);
+                var total = advances + declines;
+                if (total == 0) return "Consolidation";
+
+                // Cast to double for division to avoid integer division
+                double advanceRatio = (double)advances / total;
+
+                // Compare with double values
+                if (advanceRatio > 0.6) return "Bull Market";
+                if (advanceRatio > 0.55) return "Bullish";
+                if (advanceRatio < 0.4) return "Bear Market";
+                if (advanceRatio < 0.45) return "Bearish";
+
+                return "Consolidation";
+            }
+            catch
+            {
+                return "Consolidation";
+            }
+        }
+
+        private string DetermineOverallSentiment((List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
+        {
+            try
+            {
+                var allStocks = categorized.LargeCap.Concat(categorized.MidCap).Concat(categorized.SmallCap).ToList();
+                if (!allStocks.Any()) return "Neutral";
+
+                // Average returns decimal, compare with decimal literals (add 'm' suffix)
+                var avgChange = allStocks.Average(s => s.ChangePercent);
+
+                if (avgChange > 1.0m) return "Bullish";
+                if (avgChange > 0.5m) return "Mildly Bullish";
+                if (avgChange < -1.0m) return "Bearish";
+                if (avgChange < -0.5m) return "Mildly Bearish";
+
+                return "Neutral";
+            }
+            catch
+            {
+                return "Neutral";
+            }
+        }
+
+        #endregion
+
+        #region Stock Data Helpers
+
+        private async Task<List<StockData>> ConvertToStockData(List<StockInfo> stockInfos)
+        {
+            var stockDataList = new List<StockData>();
+
+            foreach (var info in stockInfos.Take(30))
+            {
+                try
+                {
+                    var stockData = await _stockService.GetStockDataAsync($"{info.Symbol}.NS");
+                    if (stockData != null)
+                    {
+                        stockDataList.Add(stockData);
+                    }
+                    await Task.Delay(200);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, $"Error converting {info.Symbol} to StockData");
+                }
+            }
+
+            return stockDataList;
+        }
+
+        private async Task<(List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap)>
+            CategorizeStocksAsync(List<StockData> stocks)
+        {
+            var largeCap = new List<StockData>();
+            var midCap = new List<StockData>();
+            var smallCap = new List<StockData>();
+
+            foreach (var stock in stocks)
+            {
+                if (stock.MarketCap >= 20000)
+                    largeCap.Add(stock);
+                else if (stock.MarketCap >= 5000)
+                    midCap.Add(stock);
+                else if (stock.MarketCap > 0)
+                    smallCap.Add(stock);
+            }
+
+            return (largeCap, midCap, smallCap);
+        }
+
+        #endregion
+
+        #region AI Prompt and Response
+
+        private string BuildAnalysisPrompt(
+            List<DailyPerformance> historicalData,
+            (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized,
+            List<StockNews> recentNews)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("You are an expert Indian stock market analyst with 20 years of experience.");
+            sb.AppendLine("Analyze the market data and provide detailed insights in the EXACT format specified below.\n");
+
+            sb.AppendLine("## LAST 10 DAYS MARKET PERFORMANCE");
+            foreach (var day in historicalData.OrderBy(d => d.Date).Take(5))
+            {
+                sb.AppendLine($"- {day.Date:dd MMM}: Nifty {day.NiftyChange:+#.##;-#.##;0}%");
+            }
+
+            sb.AppendLine("\n## LARGE CAP STOCKS");
+            foreach (var stock in categorized.LargeCap.Take(5))
+            {
+                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%)");
+            }
+
+            sb.AppendLine("\n## MID CAP STOCKS");
+            foreach (var stock in categorized.MidCap.Take(5))
+            {
+                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%)");
+            }
+
+            sb.AppendLine("\n## SMALL CAP STOCKS");
+            foreach (var stock in categorized.SmallCap.Take(5))
+            {
+                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%)");
+            }
+
+            sb.AppendLine("\n## RECENT NEWS");
+            foreach (var news in recentNews.Take(3))
+            {
+                sb.AppendLine($"- {news.Title}");
+            }
+
+            sb.AppendLine(@"
+## RESPONSE FORMAT:
+
+MARKET_PHASE: [Bull/Bear/Sideways/Consolidation]
+SENTIMENT: [Bullish/Bearish/Neutral]
+
+LARGE_CAP PICKS (5 stocks):
+[Symbol1] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol2] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol4] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol5] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+
+MID_CAP PICKS (3 stocks):
+[Symbol1] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol2] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+
+SMALL_CAP PICKS (3 stocks):
+[Symbol1] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol2] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]
+[Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]");
+
+            return sb.ToString();
+        }
+
+        private async Task<string> GetAIMarketAnalysis(string prompt)
+        {
+            try
+            {
+                return await _aiService.GetMarketInsightAsync(new List<StockData>());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting AI analysis");
+                return "";
+            }
+        }
+
+        private EnhancedMarketAnalysis ParseAIResponse(string aiResponse,
+            (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
+        {
+            var analysis = new EnhancedMarketAnalysis
+            {
+                AnalysisDate = DateTime.Now,
+                LargeCap = new CategoryAnalysis { Category = "Large Cap" },
+                MidCap = new CategoryAnalysis { Category = "Mid Cap" },
+                SmallCap = new CategoryAnalysis { Category = "Small Cap" },
+                KeyNewsImpacts = new List<NewsImpactAnalysis>(),
+                TechnicalIndicators = new TechnicalSummary()
+            };
+
+            try
+            {
+                if (string.IsNullOrEmpty(aiResponse))
+                {
+                    _logger.LogWarning("Empty AI response");
+                    return analysis;
+                }
+
+                var lines = aiResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                string currentSection = "";
+
+                foreach (var line in lines)
+                {
+                    var trimmedLine = line.Trim();
+
+                    if (trimmedLine.StartsWith("MARKET_PHASE:"))
+                        analysis.MarketPhase = trimmedLine.Replace("MARKET_PHASE:", "").Trim();
+                    else if (trimmedLine.StartsWith("SENTIMENT:"))
+                        analysis.OverallSentiment = trimmedLine.Replace("SENTIMENT:", "").Trim();
+                    else if (trimmedLine.Contains("LARGE_CAP PICKS"))
+                        currentSection = "LARGE";
+                    else if (trimmedLine.Contains("MID_CAP PICKS"))
+                        currentSection = "MID";
+                    else if (trimmedLine.Contains("SMALL_CAP PICKS"))
+                        currentSection = "SMALL";
+                    else if ((currentSection == "LARGE" || currentSection == "MID" || currentSection == "SMALL") &&
+                             trimmedLine.Contains("|"))
+                    {
+                        var pick = ParsePickFromLine(trimmedLine,
+                            currentSection == "LARGE" ? categorized.LargeCap :
+                            currentSection == "MID" ? categorized.MidCap :
+                            categorized.SmallCap);
+
+                        if (pick != null)
+                        {
+                            if (currentSection == "LARGE")
+                                analysis.LargeCap.TopPicks.Add(pick);
+                            else if (currentSection == "MID")
+                                analysis.MidCap.TopPicks.Add(pick);
+                            else if (currentSection == "SMALL")
+                                analysis.SmallCap.TopPicks.Add(pick);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing AI response");
+            }
+
+            return analysis;
+        }
+
+        private TopStockPick? ParsePickFromLine(string line, List<StockData> stocks)
+        {
+            try
+            {
+                var parts = line.Split('|', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2) return null;
+
+                var symbol = parts[0].Trim().Replace("•", "").Trim();
+                var stock = stocks.FirstOrDefault(s => s.Symbol == symbol);
+                if (stock == null) return null;
+
+                var pick = new TopStockPick
+                {
+                    Symbol = symbol,
+                    CompanyName = stock.Name,
+                    Timeframe = "Next 10 days"
+                };
+
+                foreach (var part in parts)
+                {
+                    if (part.Contains("Target:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var targetStr = System.Text.RegularExpressions.Regex.Replace(part, @"[^0-9.]", "");
+                        decimal.TryParse(targetStr, out decimal target);
+                        pick.TargetPrice = target > 0 ? target : stock.Price * 1.08m;
+                    }
+                    else if (part.Contains("Stop Loss:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var slStr = System.Text.RegularExpressions.Regex.Replace(part, @"[^0-9.]", "");
+                        decimal.TryParse(slStr, out decimal sl);
+                        pick.StopLoss = sl > 0 ? sl : stock.Price * 0.95m;
+                    }
+                    else if (part.Contains("Confidence:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var confStr = System.Text.RegularExpressions.Regex.Replace(part, @"[^0-9.]", "");
+                        decimal.TryParse(confStr, out decimal conf);
+                        pick.Confidence = conf > 0 ? conf : 80;
+                    }
+                    else if (part.Contains("Reason:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        pick.Reason = part.Replace("Reason:", "").Trim();
+                    }
+                }
+
+                if (pick.TargetPrice == 0) pick.TargetPrice = stock.Price * 1.08m;
+                if (pick.StopLoss == 0) pick.StopLoss = stock.Price * 0.95m;
+                if (pick.Confidence == 0) pick.Confidence = 80;
+                if (string.IsNullOrEmpty(pick.Reason)) pick.Reason = GetDefaultReason(stock);
+
+                return pick;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        #endregion
+
+        #region Fallback Pick Generation
+
+        // In your categorization logic, ensure stocks are properly segregated
+        // This should be handled in your stock list service, but add a safety check:
+
+        private List<TopStockPick> GenerateFallbackPicks(List<StockData> stocks, string category)
+        {
+            var picks = new List<TopStockPick>();
+
+            if (stocks == null || !stocks.Any())
+            {
+                return GetDefaultPicksForCategory(category);
+            }
+
+            // Filter by market cap to ensure proper categorization
+            var filteredStocks = category.ToLower() switch
+            {
+                "large" => stocks.Where(s => s.MarketCap >= 20000).ToList(),
+                "mid" => stocks.Where(s => s.MarketCap >= 5000 && s.MarketCap < 20000).ToList(),
+                "small" => stocks.Where(s => s.MarketCap < 5000).ToList(),
+                _ => stocks
+            };
+
+            var candidates = filteredStocks
+                .Where(s => s.Price > 10 && s.MarketCap > 100)
+                .OrderByDescending(s => s.ChangePercent > 0 ? s.ChangePercent : 0)
+                .ThenByDescending(s => s.MarketCap)
+                .Take(15)
+                .ToList();
+
+            int targetCount = category.ToLower() == "large" ? 5 : 3;
+
+            foreach (var stock in candidates.Take(targetCount))
+            {
+                var confidence = 65 + (int)(Math.Abs(stock.ChangePercent) * 3);
+                confidence = Math.Min(92, Math.Max(60, confidence));
+
+                decimal targetMultiplier = category.ToLower() switch
+                {
+                    "large" => stock.ChangePercent > 2 ? 1.10m : 1.08m,
+                    "mid" => stock.ChangePercent > 3 ? 1.15m : 1.12m,
+                    "small" => stock.ChangePercent > 4 ? 1.20m : 1.15m,
+                    _ => 1.08m
+                };
+
+                picks.Add(new TopStockPick
+                {
+                    Symbol = stock.Symbol,
+                    CompanyName = stock.Name,
+                    TargetPrice = Math.Round(stock.Price * targetMultiplier, 0),
+                    StopLoss = Math.Round(stock.Price * 0.92m, 0),
+                    Confidence = confidence,
+                    Reason = GetDynamicReason(stock),
+                    Timeframe = "Next 10 days"
+                });
+            }
+
+            // Remove duplicates by symbol within this category
+            picks = picks.GroupBy(p => p.Symbol).Select(g => g.First()).ToList();
+
+            if (picks.Count < targetCount)
+            {
+                var defaultPicks = GetDefaultPicksForCategory(category);
+                var existingSymbols = picks.Select(p => p.Symbol).ToHashSet();
+                var newDefaults = defaultPicks.Where(p => !existingSymbols.Contains(p.Symbol)).Take(targetCount - picks.Count);
+                picks.AddRange(newDefaults);
+            }
+
+            return picks;
+        }
+
+        private string GetDynamicReason(StockData stock)
+        {
+            // Array of possible reasons based on performance
+            var reasons = new[]
+            {
+        "Strong breakout with high volume momentum",
+        "Building strong momentum with institutional buying",
+        "Positive trend with good technical setup",
+        "Consolidating with potential breakout",
+        "Stable with gradual accumulation",
+        "Undervalued with strong fundamentals",
+        "Value buying opportunity at support levels",
+        "Technical bounce from oversold levels",
+        "Sector leader showing relative strength",
+        "Earnings growth with improving margins"
+    };
+
+            // Select reason based on performance
+            if (stock.ChangePercent > 5) return reasons[0];
+            if (stock.ChangePercent > 3) return reasons[1];
+            if (stock.ChangePercent > 2) return reasons[2];
+            if (stock.ChangePercent > 1) return reasons[3];
+            if (stock.ChangePercent > 0) return reasons[4];
+            if (stock.ChangePercent > -2) return reasons[5];
+            if (stock.ChangePercent > -5) return reasons[6];
+            return reasons[7];
+        }
+
+        private string GetDefaultReason(StockData stock)
+        {
+            return stock.ChangePercent switch
+            {
+                > 3 => "Strong breakout with high volume",
+                > 2 => "Building momentum with institutional buying",
+                > 1 => "Positive trend with good technical setup",
+                > 0 => "Consolidating with breakout potential",
+                > -1 => "Stable with value buying opportunity",
+                _ => "Undervalued with strong fundamentals"
+            };
+        }
+
+        private List<TopStockPick> GetDefaultPicksForCategory(string category)
+        {
+            return category.ToLower() switch
+            {
+                "large" => new List<TopStockPick>
+        {
+            new() { Symbol = "RELIANCE", CompanyName = "Reliance Industries", TargetPrice = 2950, StopLoss = 2650, Confidence = 92,
+                Reason = "Strong technical breakout, O2C business recovery", Timeframe = "Next 10 days" },
+            new() { Symbol = "TCS", CompanyName = "Tata Consultancy Services", TargetPrice = 4200, StopLoss = 3750, Confidence = 88,
+                Reason = "IT spending rebound, large deal wins", Timeframe = "Next 10 days" },
+            new() { Symbol = "HDFCBANK", CompanyName = "HDFC Bank", TargetPrice = 1750, StopLoss = 1600, Confidence = 85,
+                Reason = "Attractive valuation, credit growth", Timeframe = "Next 10 days" },
+            new() { Symbol = "INFY", CompanyName = "Infosys", TargetPrice = 1650, StopLoss = 1500, Confidence = 82,
+                Reason = "Strong order book, digital transformation", Timeframe = "Next 10 days" },
+            new() { Symbol = "ICICIBANK", CompanyName = "ICICI Bank", TargetPrice = 1250, StopLoss = 1100, Confidence = 80,
+                Reason = "Consistent performance, NIM expansion", Timeframe = "Next 10 days" }
+        },
+                "mid" => new List<TopStockPick>
+        {
+            new() { Symbol = "PERSISTENT", CompanyName = "Persistent Systems", TargetPrice = 4800, StopLoss = 4200, Confidence = 90,
+                Reason = "Strong momentum, deal wins", Timeframe = "Next 10 days" },
+            new() { Symbol = "LTTS", CompanyName = "L&T Technology Services", TargetPrice = 4500, StopLoss = 4000, Confidence = 87,
+                Reason = "Technical breakout, ER&D spending", Timeframe = "Next 10 days" },
+            new() { Symbol = "FEDERALBNK", CompanyName = "Federal Bank", TargetPrice = 180, StopLoss = 155, Confidence = 82,
+                Reason = "Value buying, improving margins", Timeframe = "Next 10 days" }
+        },
+                "small" => new List<TopStockPick>
+        {
+            new() { Symbol = "KAYNES", CompanyName = "Kaynes Technology", TargetPrice = 3500, StopLoss = 2900, Confidence = 85,
+                Reason = "Strong quarterly results", Timeframe = "Next 10 days" },
+            new() { Symbol = "KPITTECH", CompanyName = "KPIT Technologies", TargetPrice = 2000, StopLoss = 1700, Confidence = 83,
+                Reason = "Technical breakout", Timeframe = "Next 10 days" },
+            new() { Symbol = "MAPMYINDIA", CompanyName = "MapMyIndia", TargetPrice = 2200, StopLoss = 1850, Confidence = 80,
+                Reason = "Volume growth", Timeframe = "Next 10 days" }
+        },
+                _ => new List<TopStockPick>()
+            };
+        }
+
+        #endregion
+
+        #region Technical Indicators
+
+        private async Task<TechnicalSummary> CalculateTechnicalIndicatorsAsync(
+            (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
+        {
+            var summary = new TechnicalSummary();
+            summary.MovingAverages = new Dictionary<string, string>();
+
+            try
+            {
+                var allStocks = categorized.LargeCap.Concat(categorized.MidCap).Concat(categorized.SmallCap).ToList();
+
+                if (allStocks.Any())
+                {
+                    var advances = allStocks.Count(s => s.ChangePercent > 0);
+                    var declines = allStocks.Count(s => s.ChangePercent < 0);
+
+                    if (advances > declines * 1.5m)
+                    {
+                        summary.RSIStatus = "Bullish Momentum";
+                        summary.MACDSignal = "Bullish Crossover";
+                        summary.VolumeAnalysis = "Strong Accumulation";
+                    }
+                    else if (declines > advances * 1.5m)
+                    {
+                        summary.RSIStatus = "Bearish Momentum";
+                        summary.MACDSignal = "Bearish Crossover";
+                        summary.VolumeAnalysis = "Strong Distribution";
+                    }
+                    else
+                    {
+                        summary.RSIStatus = "Neutral";
+                        summary.MACDSignal = "Neutral";
+                        summary.VolumeAnalysis = "Average Volume";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error calculating technical indicators");
+            }
+
+            return summary;
+        }
+
+        #endregion
+
+        #region News Impact
+
+        private async Task<List<NewsImpactAnalysis>> AnalyzeNewsImpact(
+            List<StockNews> news,
+            (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
+        {
+            var impacts = new List<NewsImpactAnalysis>();
+
+            foreach (var item in news.Take(5))
+            {
+                impacts.Add(new NewsImpactAnalysis
+                {
+                    Headline = item.Title.Length > 100 ? item.Title.Substring(0, 97) + "..." : item.Title,
+                    Source = item.Source,
+                    PublishedAt = item.PublishedAt,
+                    Impact = item.Sentiment ?? "Neutral"
+                });
+            }
+
+            return impacts;
+        }
+
+        #endregion
+
+        #region Historical Data
+
+        private async Task<List<DailyPerformance>> GetHistoricalDataAsync(int days = 10)
+        {
+            var historicalData = new List<DailyPerformance>();
+
+            try
+            {
+                var client = _httpClientFactory.CreateClient();
+                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+
+                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/^NSEI?range={days}d&interval=1d";
+                var response = await client.GetAsync(url);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    for (int i = 0; i < days; i++)
+                    {
+                        historicalData.Add(new DailyPerformance
+                        {
+                            Date = DateTime.Now.AddDays(-i),
+                            NiftyChange = new Random().Next(-2, 3),
+                            MarketSentiment = i % 2 == 0 ? "Bullish" : "Bearish"
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching historical data");
+            }
+
+            return historicalData;
+        }
+
+        #endregion
+
+        #region Public Methods
 
         public async Task<string> GenerateDetailedReportAsync()
         {
@@ -106,945 +887,18 @@ namespace StockNotificationApi.Services
             var categorized = await CategorizeStocksAsync(allStocks);
             var summary = await CalculateTechnicalIndicatorsAsync(categorized);
 
-            // Convert TechnicalSummary to Dictionary<string, object> for the API response
             return new Dictionary<string, object>
             {
                 ["rsi"] = summary.RSIStatus,
                 ["macd"] = summary.MACDSignal,
-                ["bollinger"] = summary.BollingerPosition,
-                ["movingAverages"] = summary.MovingAverages,
                 ["volume"] = summary.VolumeAnalysis
             };
         }
 
-        #region Private Methods
+        #endregion
 
-        private async Task<List<DailyPerformance>> GetHistoricalDataAsync(int days = 10)
-        {
-            var historicalData = new List<DailyPerformance>();
+        #region Formatting
 
-            try
-            {
-                var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
-
-                // Get Nifty historical data from Yahoo Finance
-                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/^NSEI?range={days}d&interval=1d";
-                var response = await client.GetAsync(url);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var content = await response.Content.ReadAsStringAsync();
-                    // Parse historical data (implement based on Yahoo response structure)
-                    // This is a simplified version
-                    for (int i = 0; i < days; i++)
-                    {
-                        historicalData.Add(new DailyPerformance
-                        {
-                            Date = DateTime.Now.AddDays(-i),
-                            NiftyChange = new Random().Next(-2, 3), // Placeholder
-                            MarketSentiment = i % 2 == 0 ? "Bullish" : "Bearish"
-                        });
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching historical data");
-            }
-
-            return historicalData;
-        }
-
-        private async Task<(List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap)>
-            CategorizeStocksAsync(List<StockData> stocks)
-        {
-            var largeCap = new List<StockData>();
-            var midCap = new List<StockData>();
-            var smallCap = new List<StockData>();
-
-            foreach (var stock in stocks)
-            {
-                if (stock.MarketCap >= 20000) // 20,000 Cr+
-                {
-                    largeCap.Add(stock);
-                }
-                else if (stock.MarketCap >= 5000) // 5,000 - 20,000 Cr
-                {
-                    midCap.Add(stock);
-                }
-                else if (stock.MarketCap > 0)
-                {
-                    smallCap.Add(stock);
-                }
-            }
-
-            return (largeCap, midCap, smallCap);
-        }
-        private string BuildAnalysisPrompt(
-    List<DailyPerformance> historicalData,
-    (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized,
-    List<StockNews> recentNews)
-        {
-            var sb = new StringBuilder();
-
-            sb.AppendLine("You are an expert Indian stock market analyst with 20 years of experience.");
-            sb.AppendLine("Analyze the market data and provide detailed insights in the EXACT format specified below.\n");
-
-            // Historical data
-            sb.AppendLine("## LAST 10 DAYS MARKET PERFORMANCE");
-            foreach (var day in historicalData.OrderBy(d => d.Date))
-            {
-                sb.AppendLine($"- {day.Date:dd MMM}: Nifty {day.NiftyChange:+#.##;-#.##;0}% | Sentiment: {day.MarketSentiment}");
-            }
-
-            // Current market data by category
-            sb.AppendLine("\n## CURRENT MARKET DATA BY CATEGORY");
-
-            sb.AppendLine("\n### LARGE CAP STOCKS (Current Prices)");
-            foreach (var stock in categorized.LargeCap.Take(10))
-            {
-                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%) | PE: {stock.PE} | Sector: {stock.Sector}");
-            }
-
-            sb.AppendLine("\n### MID CAP STOCKS (Current Prices)");
-            foreach (var stock in categorized.MidCap.Take(10))
-            {
-                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%) | PE: {stock.PE} | Sector: {stock.Sector}");
-            }
-
-            sb.AppendLine("\n### SMALL CAP STOCKS (Current Prices)");
-            foreach (var stock in categorized.SmallCap.Take(10))
-            {
-                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%) | PE: {stock.PE} | Sector: {stock.Sector}");
-            }
-
-            // Recent news
-            sb.AppendLine("\n## RECENT MARKET NEWS");
-            foreach (var news in recentNews.Take(10))
-            {
-                sb.AppendLine($"- {news.Title} (Source: {news.Source}, Sentiment: {news.Sentiment})");
-            }
-
-            // Analysis requirements with explicit format
-            sb.AppendLine(@"
-## ANALYSIS REQUIREMENTS - PROVIDE EXACTLY IN THIS FORMAT
-
-Based on the data above, provide your analysis in the following EXACT format:
-
-MARKET_PHASE: [Bull/Bear/Sideways/Consolidation]
-OVERALL_SENTIMENT: [Bullish/Bearish/Neutral]
-CONFIDENCE: [0-100]
-
-LAST_10_SUMMARY:
-• Point 1 about key trends
-• Point 2 about major events
-• Point 3 about sector performance
-• Point 4 about FII/DII activity
-
-NEXT_10_PREDICTIONS:
-• Expected Range: [min-max]
-• Support: [level] | Resistance: [level]
-• Sector to watch: [sector1], [sector2], [sector3]
-• Key drivers: [driver1], [driver2]
-
-LARGE_CAP_PICKS:
-[Symbol1] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol2] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol4] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol5] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-
-MID_CAP_PICKS:
-[Symbol1] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol2] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol4] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol5] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-
-SMALL_CAP_PICKS:
-[Symbol1] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol2] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol4] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-[Symbol5] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief reason]
-
-NEWS_IMPACT:
-• [Headline] | Impact: [Positive/Negative/Neutral] | Affected: [sectors/stocks]
-• [Headline] | Impact: [Positive/Negative/Neutral] | Affected: [sectors/stocks]
-• [Headline] | Impact: [Positive/Negative/Neutral] | Affected: [sectors/stocks]
-
-RISK_FACTORS:
-• Risk factor 1
-• Risk factor 2
-• Risk factor 3
-• Risk factor 4
-
-TECHNICAL_OUTLOOK:
-RSI: [status]
-MACD: [signal]
-Moving Averages: [status]
-Volume: [analysis]
-
-IMPORTANT: Use ONLY the actual stock symbols from the data provided. Provide realistic target prices based on current prices (typically 5-15% above current price).");
-
-            return sb.ToString();
-        }
-
-        //        private string BuildAnalysisPrompt(
-        //            List<DailyPerformance> historicalData,
-        //            (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized,
-        //            List<StockNews> recentNews)
-        //        {
-        //            var sb = new StringBuilder();
-
-        //            sb.AppendLine("You are an expert Indian stock market analyst with 20 years of experience.");
-        //            sb.AppendLine("Analyze the market data and provide detailed insights.\n");
-
-        //            // Historical data
-        //            sb.AppendLine("## LAST 10 DAYS MARKET PERFORMANCE");
-        //            foreach (var day in historicalData.OrderBy(d => d.Date))
-        //            {
-        //                sb.AppendLine($"- {day.Date:dd MMM}: Nifty {day.NiftyChange:+#.##;-#.##;0}% | Sentiment: {day.MarketSentiment}");
-        //            }
-
-        //            // Current market data by category
-        //            sb.AppendLine("\n## CURRENT MARKET DATA BY CATEGORY");
-
-        //            sb.AppendLine("\n### LARGE CAP STOCKS (Top 10)");
-        //            foreach (var stock in categorized.LargeCap.Take(10))
-        //            {
-        //                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%) | PE: {stock.PE} | Sector: {stock.Sector}");
-        //            }
-
-        //            sb.AppendLine("\n### MID CAP STOCKS (Top 10)");
-        //            foreach (var stock in categorized.MidCap.Take(10))
-        //            {
-        //                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%) | PE: {stock.PE} | Sector: {stock.Sector}");
-        //            }
-
-        //            sb.AppendLine("\n### SMALL CAP STOCKS (Top 10)");
-        //            foreach (var stock in categorized.SmallCap.Take(10))
-        //            {
-        //                sb.AppendLine($"- {stock.Symbol}: ₹{stock.Price:F2} ({stock.ChangePercent:F2}%) | PE: {stock.PE} | Sector: {stock.Sector}");
-        //            }
-
-        //            // Recent news
-        //            sb.AppendLine("\n## RECENT MARKET NEWS (Last 24 hours)");
-        //            foreach (var news in recentNews.Take(10))
-        //            {
-        //                sb.AppendLine($"- {news.Title} (Source: {news.Source}, Sentiment: {news.Sentiment})");
-        //            }
-
-        //            // Analysis requirements
-        //            sb.AppendLine("\n## ANALYSIS REQUIREMENTS");
-        //            sb.AppendLine(@"
-        //Based on the historical data, current market conditions, and recent news, provide:
-
-        //1. **MARKET PHASE ANALYSIS**: Identify current market phase (Bull/Bear/Sideways) with evidence
-        //2. **LAST 10 DAYS SUMMARY**: Key trends, events, and sector rotations
-        //3. **NEXT 10 DAYS PREDICTIONS**: 
-        //   - Expected market direction with confidence level
-        //   - Key support/resistance levels for Nifty
-        //   - Sector-wise outlook
-        //4. **CATEGORY-WISE PICKS** (5 each):
-        //   - Large Cap: Top 5 stocks to BUY with targets and rationale
-        //   - Mid Cap: Top 5 stocks to BUY with targets and rationale
-        //   - Small Cap: Top 5 stocks to BUY with targets and rationale
-        //5. **STOCKS TO AVOID** (3 per category)
-        //6. **NEWS IMPACT ANALYSIS**: How recent news will affect different sectors
-        //7. **TECHNICAL OUTLOOK**: RSI, MACD, moving averages status
-        //8. **RISK FACTORS**: Key risks to watch in next 10 days
-        //9. **OPPORTUNITY ALERTS**: Specific breakout/reversal opportunities
-
-        //Format the response in clear sections with bullet points for easy reading.");
-
-        //            return sb.ToString();
-        //        }
-
-        private async Task<string> GetAIMarketAnalysis(string prompt)
-        {
-            try
-            {
-                return await _aiService.GetMarketInsightAsync(new List<StockData>()); // Reuse existing AI service
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting AI analysis");
-                return GetFallbackAnalysis();
-            }
-        }
-
-        private string GetFallbackAnalysis()
-        {
-            return @"📊 MARKET ANALYSIS (Fallback Mode)
-
-Last 10 Days: Market showing mixed trends with banking and IT sectors leading.
-
-Next 10 Days Prediction:
-- Nifty range: 22,000 - 22,800
-- Key support: 21,800
-- Key resistance: 23,000
-
-Large Cap Picks:
-• RELIANCE: Buy (Target: ₹2,800)
-• TCS: Buy (Target: ₹3,900)
-• HDFCBANK: Hold
-
-Mid Cap Picks:
-• PERSISTENT: Buy (Target: ₹4,500)
-• LTTS: Buy (Target: ₹4,200)
-
-Small Cap Picks:
-• KAYNES: Buy (Target: ₹3,200)
-• KPITTECH: Buy (Target: ₹1,800)
-
-Risks to Watch:
-- Global market cues
-- FII selling pressure
-- Crude oil prices";
-        }
-
-        //private EnhancedMarketAnalysis ParseAIResponse(string aiResponse,
-        //    (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
-        //{
-        //    var analysis = new EnhancedMarketAnalysis
-        //    {
-        //        AnalysisDate = DateTime.Now,
-        //        OverallSentiment = ExtractSentiment(aiResponse),
-        //        MarketPhase = ExtractMarketPhase(aiResponse)
-        //    };
-
-        //    // Parse category-wise picks
-        //    analysis.LargeCap.TopPicks = ExtractTopPicks(aiResponse, "Large Cap", categorized.LargeCap);
-        //    analysis.MidCap.TopPicks = ExtractTopPicks(aiResponse, "Mid Cap", categorized.MidCap);
-        //    analysis.SmallCap.TopPicks = ExtractTopPicks(aiResponse, "Small Cap", categorized.SmallCap);
-
-        //    // Parse stocks to avoid
-        //    analysis.LargeCap.AvoidStocks = ExtractAvoidStocks(aiResponse, "Large Cap");
-        //    analysis.MidCap.AvoidStocks = ExtractAvoidStocks(aiResponse, "Mid Cap");
-        //    analysis.SmallCap.AvoidStocks = ExtractAvoidStocks(aiResponse, "Small Cap");
-
-        //    return analysis;
-        //}
-        private EnhancedMarketAnalysis ParseAIResponse(string aiResponse,
-    (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
-        {
-            var analysis = new EnhancedMarketAnalysis
-            {
-                AnalysisDate = DateTime.Now,
-                LargeCap = new CategoryAnalysis { Category = "Large Cap" },
-                MidCap = new CategoryAnalysis { Category = "Mid Cap" },
-                SmallCap = new CategoryAnalysis { Category = "Small Cap" },
-                KeyNewsImpacts = new List<NewsImpactAnalysis>(),
-                TechnicalIndicators = new TechnicalSummary()
-            };
-
-            try
-            {
-                // Split response into lines
-                var lines = aiResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-
-                string currentSection = "";
-                var largeCapPicks = new List<TopStockPick>();
-                var midCapPicks = new List<TopStockPick>();
-                var smallCapPicks = new List<TopStockPick>();
-
-                foreach (var line in lines)
-                {
-                    var trimmedLine = line.Trim();
-
-                    // Detect sections
-                    if (trimmedLine.StartsWith("MARKET_PHASE:"))
-                        analysis.MarketPhase = trimmedLine.Replace("MARKET_PHASE:", "").Trim();
-                    else if (trimmedLine.StartsWith("OVERALL_SENTIMENT:"))
-                        analysis.OverallSentiment = trimmedLine.Replace("OVERALL_SENTIMENT:", "").Trim();
-                    else if (trimmedLine.StartsWith("CONFIDENCE:"))
-                    {
-                        var confidenceStr = trimmedLine.Replace("CONFIDENCE:", "").Trim();
-                        decimal.TryParse(confidenceStr, out decimal confidence);
-                        analysis.ConfidenceScore = confidence;
-                    }
-                    else if (trimmedLine.StartsWith("LARGE_CAP_PICKS:"))
-                        currentSection = "LARGE";
-                    else if (trimmedLine.StartsWith("MID_CAP_PICKS:"))
-                        currentSection = "MID";
-                    else if (trimmedLine.StartsWith("SMALL_CAP_PICKS:"))
-                        currentSection = "SMALL";
-                    else if (trimmedLine.StartsWith("NEWS_IMPACT:"))
-                        currentSection = "NEWS";
-                    else if (trimmedLine.StartsWith("RISK_FACTORS:"))
-                        currentSection = "RISK";
-                    else if (trimmedLine.StartsWith("TECHNICAL_OUTLOOK:"))
-                        currentSection = "TECH";
-
-                    // Parse based on current section
-                    else if (currentSection == "LARGE" && trimmedLine.Contains("|"))
-                    {
-                        var pick = ParsePickFromLine(trimmedLine, categorized.LargeCap);
-                        if (pick != null)
-                            largeCapPicks.Add(pick);
-                    }
-                    else if (currentSection == "MID" && trimmedLine.Contains("|"))
-                    {
-                        var pick = ParsePickFromLine(trimmedLine, categorized.MidCap);
-                        if (pick != null)
-                            midCapPicks.Add(pick);
-                    }
-                    else if (currentSection == "SMALL" && trimmedLine.Contains("|"))
-                    {
-                        var pick = ParsePickFromLine(trimmedLine, categorized.SmallCap);
-                        if (pick != null)
-                            smallCapPicks.Add(pick);
-                    }
-                    else if (currentSection == "NEWS" && trimmedLine.StartsWith("•"))
-                    {
-                        var newsImpact = ParseNewsImpact(trimmedLine);
-                        if (newsImpact != null)
-                            analysis.KeyNewsImpacts.Add(newsImpact);
-                    }
-                    else if (currentSection == "TECH" && trimmedLine.Contains(":"))
-                    {
-                        ParseTechnicalIndicator(trimmedLine, analysis.TechnicalIndicators);
-                    }
-                }
-
-                // Add picks to analysis
-                analysis.LargeCap.TopPicks = largeCapPicks;
-                analysis.MidCap.TopPicks = midCapPicks;
-                analysis.SmallCap.TopPicks = smallCapPicks;
-
-                // If no picks were parsed, generate fallback picks
-                if (!analysis.LargeCap.TopPicks.Any())
-                    analysis.LargeCap.TopPicks = GenerateFallbackPicks(categorized.LargeCap, "Large");
-
-                if (!analysis.MidCap.TopPicks.Any())
-                    analysis.MidCap.TopPicks = GenerateFallbackPicks(categorized.MidCap, "Mid");
-
-                if (!analysis.SmallCap.TopPicks.Any())
-                    analysis.SmallCap.TopPicks = GenerateFallbackPicks(categorized.SmallCap, "Small");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error parsing AI response");
-
-                // Generate fallback picks
-                analysis.LargeCap.TopPicks = GenerateFallbackPicks(categorized.LargeCap, "Large");
-                analysis.MidCap.TopPicks = GenerateFallbackPicks(categorized.MidCap, "Mid");
-                analysis.SmallCap.TopPicks = GenerateFallbackPicks(categorized.SmallCap, "Small");
-            }
-
-            return analysis;
-        }
-
-        private TopStockPick? ParsePickFromLine(string line, List<StockData> stocks)
-        {
-            try
-            {
-                // Expected format: "RELIANCE | Target: 2950 | Stop Loss: 2650 | Confidence: 92 | Reason: Strong technical breakout"
-                var parts = line.Split('|', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 4) return null;
-
-                var symbol = parts[0].Trim().Replace("•", "").Trim();
-
-                // Find matching stock
-                var stock = stocks.FirstOrDefault(s => s.Symbol == symbol);
-                if (stock == null) return null;
-
-                var pick = new TopStockPick
-                {
-                    Symbol = symbol,
-                    CompanyName = stock.Name
-                };
-
-                foreach (var part in parts)
-                {
-                    if (part.Contains("Target:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var targetStr = part.Replace("Target:", "").Replace("₹", "").Trim();
-                        decimal.TryParse(targetStr, out decimal target);
-                        pick.TargetPrice = target;
-                    }
-                    else if (part.Contains("Stop Loss:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var slStr = part.Replace("Stop Loss:", "").Replace("₹", "").Trim();
-                        decimal.TryParse(slStr, out decimal sl);
-                        pick.StopLoss = sl;
-                    }
-                    else if (part.Contains("Confidence:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var confStr = part.Replace("Confidence:", "").Replace("%", "").Trim();
-                        decimal.TryParse(confStr, out decimal conf);
-                        pick.Confidence = conf;
-                    }
-                    else if (part.Contains("Reason:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        pick.Reason = part.Replace("Reason:", "").Trim();
-                    }
-                }
-
-                return pick;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private List<TopStockPick> GenerateFallbackPicks(List<StockData> stocks, string category)
-        {
-            var picks = new List<TopStockPick>();
-
-            foreach (var stock in stocks.Where(s => s.ChangePercent > 0).Take(5))
-            {
-                var confidence = Math.Min(95, 70 + (int)Math.Abs(stock.ChangePercent * 5));
-
-                picks.Add(new TopStockPick
-                {
-                    Symbol = stock.Symbol,
-                    CompanyName = stock.Name,
-                    TargetPrice = stock.Price * 1.08m, // 8% upside
-                    StopLoss = stock.Price * 0.95m, // 5% downside
-                    Confidence = confidence,
-                    Reason = stock.ChangePercent > 2 ? "Strong momentum with volume" :
-                             stock.ChangePercent > 1 ? "Positive trend with support" :
-                             "Consolidating with breakout potential",
-                    Timeframe = "Next 10 days"
-                });
-            }
-
-            return picks;
-        }
-
-        private NewsImpactAnalysis? ParseNewsImpact(string line)
-        {
-            try
-            {
-                // Format: "• Stock Market Highlights: Sensex Tanks 1,097 Points | Impact: Negative | Affected: Banking, IT"
-                var parts = line.Replace("•", "").Split('|', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 2) return null;
-
-                var impact = new NewsImpactAnalysis
-                {
-                    Headline = parts[0].Trim()
-                };
-
-                foreach (var part in parts)
-                {
-                    if (part.Contains("Impact:", StringComparison.OrdinalIgnoreCase))
-                        impact.Impact = part.Replace("Impact:", "").Trim();
-                    else if (part.Contains("Affected:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var affected = part.Replace("Affected:", "").Trim();
-                        impact.AffectedSector = affected;
-                        impact.AffectedStocks = affected.Split(',').Select(s => s.Trim()).ToList();
-                    }
-                }
-
-                return impact;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private void ParseTechnicalIndicator(string line, TechnicalSummary summary)
-        {
-            if (line.Contains("RSI:", StringComparison.OrdinalIgnoreCase))
-                summary.RSIStatus = line.Replace("RSI:", "").Trim();
-            else if (line.Contains("MACD:", StringComparison.OrdinalIgnoreCase))
-                summary.MACDSignal = line.Replace("MACD:", "").Trim();
-            else if (line.Contains("Moving Averages:", StringComparison.OrdinalIgnoreCase))
-                summary.MovingAverages["Summary"] = line.Replace("Moving Averages:", "").Trim();
-            else if (line.Contains("Volume:", StringComparison.OrdinalIgnoreCase))
-                summary.VolumeAnalysis = line.Replace("Volume:", "").Trim();
-        }
-        private string ExtractSentiment(string response)
-        {
-            if (response.Contains("bullish", StringComparison.OrdinalIgnoreCase))
-                return "Bullish";
-            if (response.Contains("bearish", StringComparison.OrdinalIgnoreCase))
-                return "Bearish";
-            return "Neutral";
-        }
-
-        private string ExtractMarketPhase(string response)
-        {
-            if (response.Contains("bull market", StringComparison.OrdinalIgnoreCase))
-                return "Bull Market";
-            if (response.Contains("bear market", StringComparison.OrdinalIgnoreCase))
-                return "Bear Market";
-            if (response.Contains("sideways", StringComparison.OrdinalIgnoreCase))
-                return "Sideways";
-            return "Consolidation";
-        }
-
-        private List<TopStockPick> ExtractTopPicks(string response, string category, List<StockData> stocks)
-        {
-            var picks = new List<TopStockPick>();
-
-            // Simple extraction logic - in production, use regex or better parsing
-            var categorySection = ExtractSection(response, category);
-
-            foreach (var stock in stocks.Take(5))
-            {
-                if (categorySection.Contains(stock.Symbol))
-                {
-                    picks.Add(new TopStockPick
-                    {
-                        Symbol = stock.Symbol,
-                        CompanyName = stock.Name,
-                        Reason = "Strong technical and fundamental outlook",
-                        TargetPrice = stock.Price * 1.1m, // 10% upside
-                        StopLoss = stock.Price * 0.95m, // 5% downside
-                        Timeframe = "Next 10 days",
-                        Confidence = 85
-                    });
-                }
-            }
-
-            return picks;
-        }
-
-        private List<TopStockPick> ExtractAvoidStocks(string response, string category)
-        {
-            // Similar to ExtractTopPicks but for stocks to avoid
-            return new List<TopStockPick>();
-        }
-
-        private string ExtractSection(string response, string sectionName)
-        {
-            var lines = response.Split('\n');
-            var section = new StringBuilder();
-            bool inSection = false;
-
-            foreach (var line in lines)
-            {
-                if (line.Contains(sectionName, StringComparison.OrdinalIgnoreCase))
-                {
-                    inSection = true;
-                    continue;
-                }
-
-                if (inSection && (line.Contains("Cap") || string.IsNullOrWhiteSpace(line)))
-                {
-                    break;
-                }
-
-                if (inSection)
-                {
-                    section.AppendLine(line);
-                }
-            }
-
-            return section.ToString();
-        }
-
-        //private async Task<Dictionary<string, object>> CalculateTechnicalIndicatorsAsync(
-        //    (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
-        //{
-        //    var indicators = new Dictionary<string, object>();
-
-        //    // Calculate for Nifty (using large caps as proxy)
-        //    var largeCapChanges = categorized.LargeCap.Select(s => s.ChangePercent).ToList();
-
-        //    if (largeCapChanges.Any())
-        //    {
-        //        indicators["RSI"] = CalculateRSI(largeCapChanges);
-        //        indicators["MarketBreadth"] = new
-        //        {
-        //            Advances = categorized.LargeCap.Count(s => s.ChangePercent > 0),
-        //            Declines = categorized.LargeCap.Count(s => s.ChangePercent < 0)
-        //        };
-        //        indicators["Volatility"] = CalculateStandardDeviation(largeCapChanges);
-        //    }
-
-        //    return indicators;
-        //}
-        //    private async Task<TechnicalSummary> CalculateTechnicalIndicatorsAsync(
-        //(List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
-        //    {
-        //        var summary = new TechnicalSummary();
-
-        //        try
-        //        {
-        //            // Calculate for Nifty (using large caps as proxy)
-        //            var largeCapChanges = categorized.LargeCap.Select(s => s.ChangePercent).ToList();
-
-        //            if (largeCapChanges.Any())
-        //            {
-        //                var rsi = CalculateRSI(largeCapChanges);
-        //                summary.RSIStatus = GetRSIStatus(rsi);
-
-        //                var advances = categorized.LargeCap.Count(s => s.ChangePercent > 0);
-        //                var declines = categorized.LargeCap.Count(s => s.ChangePercent < 0);
-
-        //                summary.VolumeAnalysis = advances > declines ? "Accumulation day" : "Distribution day";
-
-        //                // Calculate moving averages
-        //                summary.MovingAverages = new Dictionary<string, string>
-        //                {
-        //                    ["SMA 20"] = CalculateSMAStatus(largeCapChanges, 20),
-        //                    ["SMA 50"] = CalculateSMAStatus(largeCapChanges, 50),
-        //                    ["EMA 20"] = CalculateEMAStatus(largeCapChanges, 20)
-        //                };
-
-        //                // Bollinger Bands position
-        //                var avgPrice = categorized.LargeCap.Average(s => s.Price);
-        //                var upperBand = avgPrice * 1.05m;
-        //                var lowerBand = avgPrice * 0.95m;
-
-        //                if (avgPrice > upperBand * 0.95m)
-        //                    summary.BollingerPosition = "Near Upper Band (Overbought)";
-        //                else if (avgPrice < lowerBand * 1.05m)
-        //                    summary.BollingerPosition = "Near Lower Band (Oversold)";
-        //                else
-        //                    summary.BollingerPosition = "Middle Band (Neutral)";
-
-        //                // MACD Signal (simplified)
-        //                summary.MACDSignal = rsi > 60 ? "Bullish Crossover" : rsi < 40 ? "Bearish Crossover" : "Neutral";
-        //            }
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            _logger.LogError(ex, "Error calculating technical indicators");
-        //        }
-
-        //        return summary;
-        //    }
-        private async Task<TechnicalSummary> CalculateTechnicalIndicatorsAsync(
-        (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
-        {
-            var summary = new TechnicalSummary();
-            summary.MovingAverages = new Dictionary<string, string>();
-
-            try
-            {
-                // Calculate for Nifty (using large caps as proxy)
-                var largeCapChanges = categorized.LargeCap.Select(s => s.ChangePercent).ToList();
-
-                if (largeCapChanges.Any())
-                {
-                    // RSI Calculation
-                    var rsi = CalculateRSI(largeCapChanges);
-                    summary.RSIStatus = GetRSIStatus(rsi);
-
-                    // Market Breadth
-                    var advances = categorized.LargeCap.Count(s => s.ChangePercent > 0);
-                    var declines = categorized.LargeCap.Count(s => s.ChangePercent < 0);
-                    var unchanged = categorized.LargeCap.Count - advances - declines;
-
-                    summary.VolumeAnalysis = advances > declines * 1.5m ? "Strong Accumulation" :
-                                             declines > advances * 1.5m ? "Strong Distribution" :
-                                             "Neutral Volume";
-
-                    // Moving Averages
-                    summary.MovingAverages["SMA 20"] = CalculateSMAStatus(largeCapChanges, 20);
-                    summary.MovingAverages["SMA 50"] = CalculateSMAStatus(largeCapChanges, 50);
-                    summary.MovingAverages["SMA 200"] = CalculateSMAStatus(largeCapChanges, 200);
-                    summary.MovingAverages["EMA 20"] = CalculateEMAStatus(largeCapChanges, 20);
-
-                    // Bollinger Bands
-                    var avgPrice = categorized.LargeCap.Average(s => s.Price);
-                    var stdDev = CalculateStandardDeviation(categorized.LargeCap.Select(s => s.Price).ToList());
-                    var upperBand = avgPrice + (2 * stdDev);
-                    var lowerBand = avgPrice - (2 * stdDev);
-
-                    if (avgPrice > upperBand * 0.98m)
-                        summary.BollingerPosition = "Near Upper Band (Overbought)";
-                    else if (avgPrice < lowerBand * 1.02m)
-                        summary.BollingerPosition = "Near Lower Band (Oversold)";
-                    else
-                        summary.BollingerPosition = "Middle Band (Neutral)";
-
-                    // MACD Signal (simplified based on trend)
-                    var shortTermMA = largeCapChanges.Take(12).Average();
-                    var longTermMA = largeCapChanges.Take(26).Average();
-
-                    if (shortTermMA > longTermMA)
-                        summary.MACDSignal = "Bullish Crossover (Buy Signal)";
-                    else if (shortTermMA < longTermMA)
-                        summary.MACDSignal = "Bearish Crossover (Sell Signal)";
-                    else
-                        summary.MACDSignal = "Neutral";
-                }
-                else
-                {
-                    summary.RSIStatus = "Insufficient data";
-                    summary.MACDSignal = "Insufficient data";
-                    summary.BollingerPosition = "Insufficient data";
-                    summary.VolumeAnalysis = "Insufficient data";
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error calculating technical indicators");
-                summary.RSIStatus = "Error in calculation";
-                summary.MACDSignal = "Error in calculation";
-            }
-
-            return summary;
-        }
-
-        private decimal CalculateStandardDeviation(List<decimal> values)
-        {
-            if (values.Count == 0) return 0;
-
-            var avg = values.Average();
-            var sum = values.Sum(v => (v - avg) * (v - avg));
-            return (decimal)Math.Sqrt((double)(sum / values.Count));
-        }
-        private string GetRSIStatus(decimal rsi)
-        {
-            if (rsi > 70) return "Overbought (Sell Signal)";
-            if (rsi > 60) return "Strong Bullish Momentum";
-            if (rsi > 50) return "Bullish Momentum";
-            if (rsi < 30) return "Oversold (Buy Signal)";
-            if (rsi < 40) return "Bearish Momentum";
-            return "Neutral";
-        }
-
-        private string CalculateSMAStatus(List<decimal> changes, int period)
-        {
-            if (changes.Count < period) return "Insufficient data";
-
-            var sma = changes.Take(period).Average();
-            var current = changes.FirstOrDefault();
-
-            if (current > sma * 1.02m) return "Above SMA (Bullish)";
-            if (current < sma * 0.98m) return "Below SMA (Bearish)";
-            return "Near SMA (Neutral)";
-        }
-
-        private string CalculateEMAStatus(List<decimal> changes, int period)
-        {
-            // Simplified EMA calculation
-            return CalculateSMAStatus(changes, period); // For now, use same logic
-        }
-        private decimal CalculateRSI(List<decimal> changes, int period = 14)
-        {
-            if (changes.Count < period) return 50;
-
-            var gains = changes.Where(c => c > 0).Average();
-            var losses = changes.Where(c => c < 0).Average() * -1;
-
-            if (losses == 0) return 100;
-
-            var rs = gains / losses;
-            return 100 - (100 / (1 + rs));
-        }
-
-        //private decimal CalculateStandardDeviation(List<decimal> values)
-        //{
-        //    var avg = values.Average();
-        //    var sum = values.Sum(v => (v - avg) * (v - avg));
-        //    return (decimal)Math.Sqrt((double)(sum / values.Count));
-        //}
-
-        private async Task<List<NewsImpactAnalysis>> AnalyzeNewsImpact(
-            List<StockNews> news,
-            (List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap) categorized)
-        {
-            var impacts = new List<NewsImpactAnalysis>();
-
-            foreach (var item in news.Take(5))
-            {
-                var impact = new NewsImpactAnalysis
-                {
-                    Headline = item.Title,
-                    Source = item.Source,
-                    PublishedAt = item.PublishedAt,
-                    Impact = item.Sentiment,
-                    ImpactScore = item.Sentiment == "Positive" ? 0.8m : item.Sentiment == "Negative" ? -0.7m : 0.2m
-                };
-
-                // Determine affected sector
-                foreach (var stock in categorized.LargeCap)
-                {
-                    if (item.Title.Contains(stock.Symbol) || item.Title.Contains(stock.Sector ?? ""))
-                    {
-                        impact.AffectedSector = stock.Sector ?? "General";
-                        impact.AffectedStocks.Add(stock.Symbol);
-                    }
-                }
-
-                impacts.Add(impact);
-            }
-
-            return impacts;
-        }
-
-        //private string FormatAnalysisForTelegram(EnhancedMarketAnalysis analysis)
-        //{
-        //    var sb = new StringBuilder();
-
-        //    sb.AppendLine($"<b>📊 ENHANCED MARKET ANALYSIS</b>");
-        //    sb.AppendLine($"<b>{analysis.AnalysisDate:dddd, MMMM d, yyyy}</b>\n");
-
-        //    sb.AppendLine($"<b>Market Phase:</b> {analysis.MarketPhase}");
-        //    sb.AppendLine($"<b>Overall Sentiment:</b> {analysis.OverallSentiment}\n");
-
-        //    // Last 10 Days Summary
-        //    sb.AppendLine("<b>📈 LAST 10 DAYS SUMMARY</b>");
-        //    sb.AppendLine("• Market showed mixed trends with volatility");
-        //    sb.AppendLine("• Banking and IT sectors led the rally");
-        //    sb.AppendLine("• Key events: RBI policy, FII flows\n");
-
-        //    // Next 10 Days Predictions
-        //    sb.AppendLine("<b>🔮 NEXT 10 DAYS PREDICTIONS</b>");
-        //    sb.AppendLine("• Expected Range: 22,000 - 22,800");
-        //    sb.AppendLine("• Support: 21,800 | Resistance: 23,000");
-        //    sb.AppendLine("• Sector to watch: Banking, IT, Pharma\n");
-
-        //    // Large Cap Picks
-        //    sb.AppendLine("<b>🏢 LARGE CAP TOP PICKS</b>");
-        //    foreach (var pick in analysis.LargeCap.TopPicks.Take(3))
-        //    {
-        //        sb.AppendLine($"• <b>{pick.Symbol}</b>: Target ₹{pick.TargetPrice:F0} | SL ₹{pick.StopLoss:F0}");
-        //        sb.AppendLine($"  {pick.Reason}");
-        //    }
-        //    sb.AppendLine();
-
-        //    // Mid Cap Picks
-        //    sb.AppendLine("<b>🏭 MID CAP TOP PICKS</b>");
-        //    foreach (var pick in analysis.MidCap.TopPicks.Take(3))
-        //    {
-        //        sb.AppendLine($"• <b>{pick.Symbol}</b>: Target ₹{pick.TargetPrice:F0} | SL ₹{pick.StopLoss:F0}");
-        //    }
-        //    sb.AppendLine();
-
-        //    // Small Cap Picks
-        //    sb.AppendLine("<b>🏗️ SMALL CAP TOP PICKS</b>");
-        //    foreach (var pick in analysis.SmallCap.TopPicks.Take(3))
-        //    {
-        //        sb.AppendLine($"• <b>{pick.Symbol}</b>: Target ₹{pick.TargetPrice:F0} | SL ₹{pick.StopLoss:F0}");
-        //    }
-        //    sb.AppendLine();
-
-        //    // News Impact
-        //    if (analysis.KeyNewsImpacts.Any())
-        //    {
-        //        sb.AppendLine("<b>📰 NEWS IMPACT ANALYSIS</b>");
-        //        foreach (var news in analysis.KeyNewsImpacts.Take(3))
-        //        {
-        //            var emoji = news.Impact == "Positive" ? "🟢" : news.Impact == "Negative" ? "🔴" : "⚪";
-        //            sb.AppendLine($"{emoji} {news.Headline}");
-        //        }
-        //        sb.AppendLine();
-        //    }
-
-        //    // Risk Factors
-        //    sb.AppendLine("<b>⚠️ KEY RISKS TO WATCH</b>");
-        //    sb.AppendLine("• Global market cues");
-        //    sb.AppendLine("• FII/DII flows");
-        //    sb.AppendLine("• Crude oil prices");
-        //    sb.AppendLine("• Dollar index movement\n");
-
-        //    sb.AppendLine("<i>Analysis based on last 10 days data and AI predictions for next 10 days</i>");
-
-        //    return sb.ToString();
-        //}
         private string FormatAnalysisForTelegram(EnhancedMarketAnalysis analysis)
         {
             var sb = new StringBuilder();
@@ -1056,17 +910,13 @@ Risks to Watch:
             sb.AppendLine($"<b>Overall Sentiment:</b> {analysis.OverallSentiment}");
             sb.AppendLine($"<b>Confidence:</b> {analysis.ConfidenceScore}%\n");
 
-            // Last 10 Days Summary
             sb.AppendLine("<b>📈 LAST 10 DAYS SUMMARY</b>");
             sb.AppendLine("• Market showed mixed trends with volatility");
-            sb.AppendLine("• Banking and IT sectors showed strength");
-            sb.AppendLine("• FII buying supported large caps\n");
+            sb.AppendLine("• Banking and IT sectors showed strength\n");
 
-            // Next 10 Days Predictions
             sb.AppendLine("<b>🔮 NEXT 10 DAYS PREDICTIONS</b>");
             sb.AppendLine("• Expected Range: 22,000 - 22,800");
-            sb.AppendLine("• Support: 21,800 | Resistance: 23,000");
-            sb.AppendLine("• Sectors to watch: Banking, IT, Pharma\n");
+            sb.AppendLine("• Support: 21,800 | Resistance: 23,000\n");
 
             // Large Cap Picks
             if (analysis.LargeCap.TopPicks.Any())
@@ -1080,20 +930,6 @@ Risks to Watch:
                 }
                 sb.AppendLine();
             }
-            else
-            {
-                // Fallback picks if AI didn't provide any
-                sb.AppendLine("<b>🏢 LARGE CAP TOP PICKS</b>");
-                sb.AppendLine("• <b>RELIANCE</b>");
-                sb.AppendLine("  Target: ₹2,950 | SL: ₹2,650 | Conf: 92%");
-                sb.AppendLine("  <i>Strong technical breakout, O2C business recovery</i>");
-                sb.AppendLine("• <b>TCS</b>");
-                sb.AppendLine("  Target: ₹4,200 | SL: ₹3,750 | Conf: 88%");
-                sb.AppendLine("  <i>IT spending rebound, large deal wins</i>");
-                sb.AppendLine("• <b>HDFCBANK</b>");
-                sb.AppendLine("  Target: ₹1,750 | SL: ₹1,600 | Conf: 85%");
-                sb.AppendLine("  <i>Attractive valuation, credit growth</i>\n");
-            }
 
             // Mid Cap Picks
             if (analysis.MidCap.TopPicks.Any())
@@ -1104,13 +940,6 @@ Risks to Watch:
                     sb.AppendLine($"• <b>{pick.Symbol}</b>: Target ₹{pick.TargetPrice:F0} | SL ₹{pick.StopLoss:F0} | Conf: {pick.Confidence}%");
                 }
                 sb.AppendLine();
-            }
-            else
-            {
-                sb.AppendLine("<b>🏭 MID CAP TOP PICKS</b>");
-                sb.AppendLine("• <b>PERSISTENT</b>: Target ₹4,800 | SL ₹4,200 | Conf: 90%");
-                sb.AppendLine("• <b>LTTS</b>: Target ₹4,500 | SL ₹4,000 | Conf: 87%");
-                sb.AppendLine("• <b>FEDERALBNK</b>: Target ₹180 | SL ₹155 | Conf: 82%\n");
             }
 
             // Small Cap Picks
@@ -1123,48 +952,68 @@ Risks to Watch:
                 }
                 sb.AppendLine();
             }
-            else
-            {
-                sb.AppendLine("<b>🏗️ SMALL CAP TOP PICKS</b>");
-                sb.AppendLine("• <b>KAYNES</b>: Target ₹3,500 | SL ₹2,900 | Conf: 85%");
-                sb.AppendLine("• <b>KPITTECH</b>: Target ₹2,000 | SL ₹1,700 | Conf: 83%");
-                sb.AppendLine("• <b>MAPMYINDIA</b>: Target ₹2,200 | SL ₹1,850 | Conf: 80%\n");
-            }
 
-            // News Impact
+            // News Impact - Show full headlines
             if (analysis.KeyNewsImpacts.Any())
             {
-                sb.AppendLine("<b>📰 NEWS IMPACT ANALYSIS</b>");
+                sb.AppendLine("<b>📰 NEWS IMPACT</b>");
                 foreach (var news in analysis.KeyNewsImpacts.Take(3))
                 {
-                    var emoji = news.Impact?.Contains("Positive") == true ? "🟢" :
-                               news.Impact?.Contains("Negative") == true ? "🔴" : "⚪";
-                    sb.AppendLine($"{emoji} {news.Headline}");
-                    if (!string.IsNullOrEmpty(news.AffectedSector))
-                        sb.AppendLine($"   Affects: {news.AffectedSector}");
+                    // Show first 100 characters of headline
+                    var headline = news.Headline.Length > 100 ? news.Headline.Substring(0, 97) + "..." : news.Headline;
+                    sb.AppendLine($"• {headline}");
                 }
                 sb.AppendLine();
             }
 
-            // Risk Factors
-            sb.AppendLine("<b>⚠️ KEY RISKS TO WATCH</b>");
-            sb.AppendLine("• Global market cues and US Fed policy");
-            sb.AppendLine("• FII/DII flow direction");
-            sb.AppendLine("• Crude oil prices above $85/bbl");
-            sb.AppendLine("• Earnings season expectations\n");
-
             // Technical Outlook
             sb.AppendLine("<b>📊 TECHNICAL OUTLOOK</b>");
-            sb.AppendLine($"RSI: {analysis.TechnicalIndicators?.RSIStatus ?? "Neutral (52)"}");
-            sb.AppendLine($"MACD: {analysis.TechnicalIndicators?.MACDSignal ?? "Bullish crossover"}");
-            sb.AppendLine($"Volume: {analysis.TechnicalIndicators?.VolumeAnalysis ?? "Above average"}");
+            sb.AppendLine($"RSI: {analysis.TechnicalIndicators?.RSIStatus ?? "Neutral"}");
+            sb.AppendLine($"MACD: {analysis.TechnicalIndicators?.MACDSignal ?? "Neutral"}");
+            sb.AppendLine($"Volume: {analysis.TechnicalIndicators?.VolumeAnalysis ?? "Average"}");
             sb.AppendLine();
 
-            sb.AppendLine("<i>Analysis based on last 10 days data and AI predictions for next 10 days</i>");
-            sb.AppendLine("<i>Use /largecap, /midcap, /smallcap for detailed picks</i>");
+            sb.AppendLine("<i>Analysis based on last 10 days data and AI predictions</i>");
 
             return sb.ToString();
         }
+
+        #endregion
+
+        #region Fallback Analysis
+
+        private EnhancedMarketAnalysis GetFallbackAnalysis()
+        {
+            return new EnhancedMarketAnalysis
+            {
+                AnalysisDate = DateTime.Now,
+                MarketPhase = "Consolidation",
+                OverallSentiment = "Neutral",
+                ConfidenceScore = 75,
+                LargeCap = new CategoryAnalysis
+                {
+                    Category = "Large Cap",
+                    TopPicks = GetDefaultPicksForCategory("large")
+                },
+                MidCap = new CategoryAnalysis
+                {
+                    Category = "Mid Cap",
+                    TopPicks = GetDefaultPicksForCategory("mid")
+                },
+                SmallCap = new CategoryAnalysis
+                {
+                    Category = "Small Cap",
+                    TopPicks = GetDefaultPicksForCategory("small")
+                },
+                TechnicalIndicators = new TechnicalSummary
+                {
+                    RSIStatus = "Neutral",
+                    MACDSignal = "Neutral",
+                    VolumeAnalysis = "Average"
+                }
+            };
+        }
+
         #endregion
     }
 }

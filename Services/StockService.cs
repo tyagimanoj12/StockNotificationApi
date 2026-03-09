@@ -34,26 +34,37 @@ namespace StockNotificationApi.Services
 
         public async Task<List<StockData>> GetIndianStockDataAsync()
         {
-            // Get top 20 stocks by market cap dynamically
-            var topStocks = await _stockListService.GetTopStocksByMarketCapAsync(20);
-            var stockDataList = new List<StockData>();
+            _logger.LogInformation("Fetching stocks for market analysis...");
 
-            foreach (var stock in topStocks)
+            // Get categories from StockListService
+            var categories = await _stockListService.GetAllCategoriesAsync();
+
+            var allStocks = new List<StockData>();
+
+            // Take top stocks from each category for balanced representation
+            var stocksToFetch = new List<StockInfo>();
+            stocksToFetch.AddRange(categories["LargeCap"].Take(40));
+            stocksToFetch.AddRange(categories["MidCap"].Take(40));
+            stocksToFetch.AddRange(categories["SmallCap"].Take(40));
+
+            _logger.LogInformation($"Fetching data for {stocksToFetch.Count} stocks...");
+
+            foreach (var stock in stocksToFetch)
             {
                 try
                 {
-                    // Determine exchange (NSE or BSE)
-                    var symbol = stock.Exchange == "BSE"
-                        ? $"{stock.Symbol}.BO"
-                        : $"{stock.Symbol}.NS";
-
-                    var stockData = await GetStockDataAsync(symbol);
-                    if (stockData != null)
+                    var stockData = await GetStockDataAsync($"{stock.Symbol}.NS");
+                    if (stockData == null)
                     {
-                        stockDataList.Add(stockData);
+                        stockData = await GetStockDataAsync($"{stock.Symbol}.BO");
                     }
 
-                    await Task.Delay(1000); // Rate limiting
+                    if (stockData != null)
+                    {
+                        allStocks.Add(stockData);
+                    }
+
+                    await Task.Delay(300);
                 }
                 catch (Exception ex)
                 {
@@ -61,7 +72,8 @@ namespace StockNotificationApi.Services
                 }
             }
 
-            return stockDataList;
+            _logger.LogInformation($"Successfully fetched {allStocks.Count} stocks");
+            return allStocks;
         }
 
         public async Task<StockData?> GetStockDataAsync(string symbol)

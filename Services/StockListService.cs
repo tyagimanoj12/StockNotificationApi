@@ -181,6 +181,7 @@ namespace StockNotificationApi.Services
 
             return sortedStocks.Take(count).ToList();
         }
+
         public async Task<List<StockInfo>> GetStocksBySectorAsync(string sector)
         {
             var allStocks = await GetNSEStocksAsync();

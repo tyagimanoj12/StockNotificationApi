@@ -12,5 +12,6 @@ namespace StockNotificationApi.Interfaces
         Task<List<StockInfo>> GetLargeCapStocksAsync(int count = 20);
         Task<List<StockInfo>> GetMidCapStocksAsync(int count = 20);
         Task<List<StockInfo>> GetSmallCapStocksAsync(int count = 20);
+        Task<Dictionary<string, List<StockInfo>>> GetAllCategoriesAsync();
     }
 }

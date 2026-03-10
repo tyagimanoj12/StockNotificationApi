@@ -16,11 +16,23 @@ namespace StockNotificationApi.Services
         private static readonly Dictionary<string, RateLimitInfo> _apiRateLimits = new();
         private static readonly object _lockObject = new();
 
-        // Cooldown periods (in minutes)
+        // Constants
         private const int ALPHA_VANTAGE_COOLDOWN = 24 * 60; // 24 hours
         private const int FREE_API_COOLDOWN = 1; // 1 minute
-        private const int NSE_API_COOLDOWN = 0; // No cooldown for NSE (reliable)
+        private const int NSE_API_COOLDOWN = 0; // No cooldown for NSE
         private const int YAHOO_COOLDOWN = 1; // 1 minute
+        private const int API_RATE_LIMIT_DELAY_MS = 500;
+        private const int HTTP_TIMEOUT_SECONDS = 30;
+        private const int MAX_RETRY_ATTEMPTS = 3;
+        private const decimal DEFAULT_YEAR_HIGH_MULTIPLIER = 1.2m;
+        private const decimal DEFAULT_YEAR_LOW_MULTIPLIER = 0.8m;
+        private const decimal DEFAULT_DAY_HIGH_MULTIPLIER = 1.02m;
+        private const decimal DEFAULT_DAY_LOW_MULTIPLIER = 0.98m;
+
+        private readonly HashSet<string> _rateLimitKeywords = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "rate limit", "25 requests", "API key", "too many requests", "rate limited"
+        };
 
         public FallbackStockService(
             IStockService primaryService,
@@ -28,23 +40,33 @@ namespace StockNotificationApi.Services
             IConfiguration configuration,
             ILogger<FallbackStockService> logger)
         {
-            _primaryService = primaryService;
-            _httpClientFactory = httpClientFactory;
-            _configuration = configuration;
-            _logger = logger;
+            _primaryService = primaryService ?? throw new ArgumentNullException(nameof(primaryService));
+            _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         public async Task<List<StockData>> GetIndianStockDataAsync()
         {
             _logger.LogInformation("FallbackService.GetIndianStockDataAsync called");
 
-            // STEP 1: ALWAYS try the primary service first (your StockService)
+            // Try primary service first
+            var stocks = await TryGetFromPrimaryService();
+            if (stocks != null)
+                return stocks;
+
+            // Fallback to configuration symbols
+            return await GetFromFallbackSymbols();
+        }
+
+        private async Task<List<StockData>?> TryGetFromPrimaryService()
+        {
             try
             {
-                _logger.LogInformation("Attempting to get stock list from primary service (StockService)");
+                _logger.LogInformation("Attempting to get stock list from primary service");
                 var stocks = await _primaryService.GetIndianStockDataAsync();
 
-                if (stocks != null && stocks.Any())
+                if (stocks?.Any() == true)
                 {
                     _logger.LogInformation("Primary service returned {Count} stocks successfully", stocks.Count);
                     return stocks;
@@ -55,23 +77,17 @@ namespace StockNotificationApi.Services
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Primary service failed to get stock list");
-
-                // Check if it's a rate limit issue
-                if (ex.Message.Contains("rate limit") || ex.Message.Contains("25 requests"))
-                {
-                    MarkApiRateLimited("AlphaVantage", ALPHA_VANTAGE_COOLDOWN);
-                }
+                CheckForRateLimit(ex.Message);
             }
 
-            // STEP 2: If primary fails, use fallback symbols from configuration
-            _logger.LogInformation("Primary service failed, using fallback symbols from configuration");
+            return null;
+        }
 
-            var symbols = _configuration.GetSection("StockApiSettings:IndianStocks").Get<List<string>>()
-                ?? new List<string> {
-            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-            "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS"
-                };
+        private async Task<List<StockData>> GetFromFallbackSymbols()
+        {
+            _logger.LogInformation("Using fallback symbols from configuration");
 
+            var symbols = GetFallbackSymbols();
             var results = new List<StockData>();
 
             foreach (var symbol in symbols)
@@ -79,12 +95,12 @@ namespace StockNotificationApi.Services
                 try
                 {
                     _logger.LogDebug("Fetching {Symbol} via fallback APIs", symbol);
-                    var stock = await GetStockDataAsync(symbol); // This calls your individual stock fallback logic
+                    var stock = await GetStockDataAsync(symbol);
                     if (stock != null)
                     {
                         results.Add(stock);
                     }
-                    await Task.Delay(500); // Be respectful to APIs
+                    await Task.Delay(API_RATE_LIMIT_DELAY_MS);
                 }
                 catch (Exception ex)
                 {
@@ -92,116 +108,145 @@ namespace StockNotificationApi.Services
                 }
             }
 
-            _logger.LogInformation("Fallback service returning {Count} stocks from fallback APIs", results.Count);
+            _logger.LogInformation("Fallback service returning {Count} stocks", results.Count);
             return results;
         }
-        //public async Task<List<StockData>> GetIndianStockDataAsync()
-        //{
-        //    var symbols = _configuration.GetSection("StockApiSettings:IndianStocks").Get<List<string>>()
-        //        ?? new List<string> { "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS" };
 
-        //    var results = new List<StockData>();
-
-        //    foreach (var symbol in symbols)
-        //    {
-        //        try
-        //        {
-        //            var stock = await GetStockDataAsync(symbol);
-        //            if (stock != null)
-        //            {
-        //                results.Add(stock);
-        //            }
-        //            await Task.Delay(500); // Be respectful to APIs
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            _logger.LogError(ex, "Error fetching {Symbol}", symbol);
-        //        }
-        //    }
-
-        //    return results;
-        //}
+        private List<string> GetFallbackSymbols()
+        {
+            return _configuration.GetSection("StockApiSettings:IndianStocks").Get<List<string>>()
+                ?? new List<string> {
+                    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+                    "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS"
+                };
+        }
 
         public async Task<StockData?> GetStockDataAsync(string symbol)
         {
-            // Clean the symbol
+            if (string.IsNullOrWhiteSpace(symbol))
+            {
+                _logger.LogWarning("Empty symbol provided");
+                return null;
+            }
+
+            var (cleanSymbol, isNSE, isBSE) = ParseSymbol(symbol);
+            _logger.LogInformation("Fetching data for {Symbol} (NSE: {IsNSE}, BSE: {IsBSE})", symbol, isNSE, isBSE);
+
+            // Try primary service first
+            var stock = await TryGetFromPrimaryServiceForSymbol(symbol);
+            if (stock != null)
+                return stock;
+
+            // Try NSE
+            if (isNSE)
+            {
+                stock = await TryGetFromNSE(cleanSymbol, symbol);
+                if (stock != null)
+                    return stock;
+            }
+
+            // Try BSE
+            if (isBSE)
+            {
+                stock = await TryGetFromBSE(cleanSymbol, symbol);
+                if (stock != null)
+                    return stock;
+            }
+
+            // Try Yahoo as last resort
+            stock = await TryGetFromYahoo(symbol);
+            if (stock != null)
+                return stock;
+
+            _logger.LogError("All APIs failed for {Symbol}", symbol);
+            return null;
+        }
+
+        private (string cleanSymbol, bool isNSE, bool isBSE) ParseSymbol(string symbol)
+        {
             var cleanSymbol = symbol.Replace(".NS", "").Replace(".NSE", "").Replace(".BO", "").Replace(".BSE", "");
             var isNSE = symbol.Contains(".NS") || symbol.Contains(".NSE") || !symbol.Contains(".BO");
             var isBSE = symbol.Contains(".BO") || symbol.Contains(".BSE");
 
-            _logger.LogInformation("Fetching data for {Symbol} (NSE: {IsNSE}, BSE: {IsBSE})", symbol, isNSE, isBSE);
+            return (cleanSymbol, isNSE, isBSE);
+        }
 
-            // TRY 1: Primary Service (Alpha Vantage)
-            if (!IsApiRateLimited("AlphaVantage"))
-            {
-                try
-                {
-                    _logger.LogInformation("Trying primary API (Alpha Vantage) for {Symbol}", symbol);
-                    var stock = await _primaryService.GetStockDataAsync(symbol);
-
-                    if (stock != null && stock.Price > 0)
-                    {
-                        _logger.LogInformation("Primary API successful for {Symbol}", symbol);
-                        return stock;
-                    }
-
-                    // Check if rate limited by making a test call
-                    var isRateLimited = await CheckAlphaVantageRateLimit();
-                    if (isRateLimited)
-                    {
-                        MarkApiRateLimited("AlphaVantage", ALPHA_VANTAGE_COOLDOWN);
-                        _logger.LogWarning("Alpha Vantage rate limit detected. Cooling down for 24 hours");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Primary API failed for {Symbol}", symbol);
-
-                    if (ex.Message.Contains("rate limit") || ex.Message.Contains("25 requests"))
-                    {
-                        MarkApiRateLimited("AlphaVantage", ALPHA_VANTAGE_COOLDOWN);
-                    }
-                }
-            }
-            else
+        private async Task<StockData?> TryGetFromPrimaryServiceForSymbol(string symbol)
+        {
+            if (IsApiRateLimited("AlphaVantage"))
             {
                 _logger.LogInformation("Alpha Vantage is in cooldown. Skipping...");
+                return null;
             }
 
-            // TRY 2: NSE Direct API (Most Reliable)
-            if (isNSE && !IsApiRateLimited("NSE"))
+            try
             {
-                var nseData = await GetFromNSEAsync(cleanSymbol);
-                if (nseData != null)
+                _logger.LogInformation("Trying primary API (Alpha Vantage) for {Symbol}", symbol);
+                var stock = await _primaryService.GetStockDataAsync(symbol);
+
+                if (stock?.Price > 0)
                 {
-                    _logger.LogInformation("NSE API successful for {Symbol}", symbol);
-                    return nseData;
+                    _logger.LogInformation("Primary API successful for {Symbol}", symbol);
+                    return stock;
+                }
+
+                var isRateLimited = await CheckAlphaVantageRateLimit();
+                if (isRateLimited)
+                {
+                    MarkApiRateLimited("AlphaVantage", ALPHA_VANTAGE_COOLDOWN);
                 }
             }
-
-            // TRY 3: BSE Direct API
-            if (isBSE && !IsApiRateLimited("BSE"))
+            catch (Exception ex)
             {
-                var bseData = await GetFromBSEAsync(cleanSymbol);
-                if (bseData != null)
-                {
-                    _logger.LogInformation("BSE API successful for {Symbol}", symbol);
-                    return bseData;
-                }
+                _logger.LogWarning(ex, "Primary API failed for {Symbol}", symbol);
+                CheckForRateLimit(ex.Message);
             }
 
-            // TRY 4: Yahoo Finance (Final Fallback)
-            if (!IsApiRateLimited("Yahoo"))
+            return null;
+        }
+
+        private async Task<StockData?> TryGetFromNSE(string cleanSymbol, string originalSymbol)
+        {
+            if (IsApiRateLimited("NSE"))
+                return null;
+
+            var nseData = await GetFromNSEAsync(cleanSymbol);
+            if (nseData != null)
             {
-                var yahooData = await GetFromYahooFinanceAsync(symbol);
-                if (yahooData != null)
-                {
-                    _logger.LogInformation("Yahoo Finance successful for {Symbol}", symbol);
-                    return yahooData;
-                }
+                _logger.LogInformation("NSE API successful for {Symbol}", originalSymbol);
+                return nseData;
             }
 
-            _logger.LogError("All APIs failed for {Symbol}", symbol);
+            return null;
+        }
+
+        private async Task<StockData?> TryGetFromBSE(string cleanSymbol, string originalSymbol)
+        {
+            if (IsApiRateLimited("BSE"))
+                return null;
+
+            var bseData = await GetFromBSEAsync(cleanSymbol);
+            if (bseData != null)
+            {
+                _logger.LogInformation("BSE API successful for {Symbol}", originalSymbol);
+                return bseData;
+            }
+
+            return null;
+        }
+
+        private async Task<StockData?> TryGetFromYahoo(string symbol)
+        {
+            if (IsApiRateLimited("Yahoo"))
+                return null;
+
+            var yahooData = await GetFromYahooFinanceAsync(symbol);
+            if (yahooData != null)
+            {
+                _logger.LogInformation("Yahoo Finance successful for {Symbol}", symbol);
+                return yahooData;
+            }
+
             return null;
         }
 
@@ -211,22 +256,36 @@ namespace StockNotificationApi.Services
         {
             try
             {
-                var client = _httpClientFactory.CreateClient();
                 var apiKey = _configuration["StockApiSettings:AlphaVantageApiKey"];
-
                 if (string.IsNullOrEmpty(apiKey))
                     return false;
 
-                var testUrl = $"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=RELIANCE.BSE&apikey={apiKey}";
+                var client = _httpClientFactory.CreateClient();
+                client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
 
+                var testUrl = $"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=RELIANCE.BSE&apikey={apiKey}";
                 var response = await client.GetAsync(testUrl);
                 var content = await response.Content.ReadAsStringAsync();
 
-                return content.Contains("rate limit") || content.Contains("25 requests") || content.Contains("API key");
+                return IsRateLimitedResponse(content);
             }
             catch
             {
                 return false;
+            }
+        }
+
+        private bool IsRateLimitedResponse(string content)
+        {
+            return _rateLimitKeywords.Any(keyword =>
+                content.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private void CheckForRateLimit(string errorMessage)
+        {
+            if (IsRateLimitedResponse(errorMessage))
+            {
+                MarkApiRateLimited("AlphaVantage", ALPHA_VANTAGE_COOLDOWN);
             }
         }
 
@@ -243,7 +302,6 @@ namespace StockNotificationApi.Services
                         return true;
                     }
 
-                    // Cooldown expired, remove it
                     _apiRateLimits.Remove(apiName);
                 }
                 return false;
@@ -254,14 +312,16 @@ namespace StockNotificationApi.Services
         {
             lock (_lockObject)
             {
+                var failureCount = _apiRateLimits.ContainsKey(apiName)
+                    ? _apiRateLimits[apiName].FailureCount + 1
+                    : 1;
+
                 _apiRateLimits[apiName] = new RateLimitInfo
                 {
                     ApiName = apiName,
                     CooldownUntil = DateTime.UtcNow.AddMinutes(cooldownMinutes),
                     LastFailureTime = DateTime.UtcNow,
-                    FailureCount = _apiRateLimits.ContainsKey(apiName)
-                        ? _apiRateLimits[apiName].FailureCount + 1
-                        : 1
+                    FailureCount = failureCount
                 };
 
                 _logger.LogWarning("API {ApiName} marked as rate limited until {CooldownUntil:yyyy-MM-dd HH:mm:ss}",
@@ -279,95 +339,20 @@ namespace StockNotificationApi.Services
             {
                 _logger.LogInformation("Trying NSE API for {Symbol}", symbol);
 
-                var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.Clear();
-                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-                client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
-                client.DefaultRequestHeaders.Add("Referer", "https://www.nseindia.com");
-
-                //// First visit homepage to get cookies
-                //var homeResponse = await client.GetAsync("https://www.nseindia.com");
-
-                //if (!homeResponse.IsSuccessStatusCode)
-                //{
-                //    _logger.LogWarning("Failed to get NSE cookies");
-                //    MarkApiRateLimited("NSE", FREE_API_COOLDOWN);
-                //    return null;
-                //}
-
-                //// Small delay to ensure cookies are set
-                //await Task.Delay(1000);
-
+                var client = CreateHttpClientWithHeaders("https://www.nseindia.com");
                 var url = $"https://www.nseindia.com/api/quote-equity?symbol={symbol.ToUpper()}";
+
                 _logger.LogDebug("NSE URL: {Url}", url);
 
                 var response = await client.GetAsync(url);
 
                 if (response.IsSuccessStatusCode)
                 {
-                    var content = await response.Content.ReadAsStringAsync();
-                    _logger.LogDebug("NSE Response received, length: {Length}", content.Length);
-
-                    var options = new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true
-                    };
-
-                    var data = JsonSerializer.Deserialize<NSEQuoteResponse>(content, options);
-
-                    if (data?.PriceInfo != null)
-                    {
-                        _logger.LogInformation("NSE API successful for {Symbol}", symbol);
-
-                        // Get day high/low from intraDayHighLow
-                        decimal dayHigh = data.PriceInfo.IntraDayHighLow?.Max ?? data.PriceInfo.LastPrice;
-                        decimal dayLow = data.PriceInfo.IntraDayHighLow?.Min ?? data.PriceInfo.LastPrice;
-
-                        // Get 52-week high/low from weekHighLow
-                        decimal yearHigh = data.PriceInfo.WeekHighLow?.Max ?? dayHigh * 1.2m;
-                        decimal yearLow = data.PriceInfo.WeekHighLow?.Min ?? dayLow * 0.8m;
-
-                        // Parse timestamp
-                        DateTime timestamp = DateTime.Now;
-                        if (!string.IsNullOrEmpty(data.Metadata?.LastUpdateTime))
-                        {
-                            DateTime.TryParse(data.Metadata.LastUpdateTime.Replace("-", " "), out timestamp);
-                        }
-
-                        return new StockData
-                        {
-                            Symbol = symbol,
-                            Name = data.Info?.CompanyName ?? symbol,
-                            Exchange = "NSE",
-                            Price = data.PriceInfo.LastPrice,
-                            Change = data.PriceInfo.Change,
-                            ChangePercent = data.PriceInfo.PChange,
-                            Open = data.PriceInfo.Open,
-                            DayHigh = dayHigh,
-                            DayLow = dayLow,
-                            PreviousClose = data.PriceInfo.PreviousClose,
-                            Volume = 0, // Volume not in this response
-                            YearHigh = yearHigh,
-                            YearLow = yearLow,
-                            MarketCap = 0, // Not provided
-                            PE = data.Metadata?.PdSymbolPe,
-                            Sector = data.IndustryInfo?.Sector,
-                            Industry = data.IndustryInfo?.Industry,
-                            Timestamp = timestamp,
-                            Isin = data.Info?.Isin
-                        };
-                    }
-                    else
-                    {
-                        _logger.LogWarning("NSE API returned but PriceInfo was null for {Symbol}", symbol);
-                    }
+                    return await ParseNSEResponse(response, symbol);
                 }
-                else
-                {
-                    _logger.LogWarning("NSE API returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
-                    MarkApiRateLimited("NSE", FREE_API_COOLDOWN);
-                }
+
+                _logger.LogWarning("NSE API returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
+                MarkApiRateLimited("NSE", FREE_API_COOLDOWN);
             }
             catch (Exception ex)
             {
@@ -376,6 +361,79 @@ namespace StockNotificationApi.Services
             }
 
             return null;
+        }
+
+        private async Task<StockData?> ParseNSEResponse(HttpResponseMessage response, string symbol)
+        {
+            var content = await response.Content.ReadAsStringAsync();
+            _logger.LogDebug("NSE Response received, length: {Length}", content.Length);
+
+            var options = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            };
+
+            var data = JsonSerializer.Deserialize<NSEQuoteResponse>(content, options);
+
+            if (data?.PriceInfo == null)
+            {
+                _logger.LogWarning("NSE API returned but PriceInfo was null for {Symbol}", symbol);
+                return null;
+            }
+
+            _logger.LogInformation("NSE API successful for {Symbol}", symbol);
+
+            var (dayHigh, dayLow) = GetDayRange(data);
+            var (yearHigh, yearLow) = GetYearRange(data, dayHigh, dayLow);
+            var timestamp = ParseTimestamp(data.Metadata?.LastUpdateTime);
+
+            return new StockData
+            {
+                Symbol = symbol,
+                Name = data.Info?.CompanyName ?? symbol,
+                Exchange = "NSE",
+                Price = data.PriceInfo.LastPrice,
+                Change = data.PriceInfo.Change,
+                ChangePercent = data.PriceInfo.PChange,
+                Open = data.PriceInfo.Open,
+                DayHigh = dayHigh,
+                DayLow = dayLow,
+                PreviousClose = data.PriceInfo.PreviousClose,
+                Volume = 0,
+                YearHigh = yearHigh,
+                YearLow = yearLow,
+                MarketCap = 0,
+                PE = data.Metadata?.PdSymbolPe,
+                Sector = data.IndustryInfo?.Sector,
+                Industry = data.IndustryInfo?.Industry,
+                Timestamp = timestamp,
+                Isin = data.Info?.Isin
+            };
+        }
+
+        private (decimal dayHigh, decimal dayLow) GetDayRange(NSEQuoteResponse data)
+        {
+            var dayHigh = data.PriceInfo.IntraDayHighLow?.Max ?? data.PriceInfo.LastPrice;
+            var dayLow = data.PriceInfo.IntraDayHighLow?.Min ?? data.PriceInfo.LastPrice;
+            return (dayHigh, dayLow);
+        }
+
+        private (decimal yearHigh, decimal yearLow) GetYearRange(NSEQuoteResponse data, decimal dayHigh, decimal dayLow)
+        {
+            var yearHigh = data.PriceInfo.WeekHighLow?.Max ?? dayHigh * DEFAULT_YEAR_HIGH_MULTIPLIER;
+            var yearLow = data.PriceInfo.WeekHighLow?.Min ?? dayLow * DEFAULT_YEAR_LOW_MULTIPLIER;
+            return (yearHigh, yearLow);
+        }
+
+        private DateTime ParseTimestamp(string? lastUpdateTime)
+        {
+            if (string.IsNullOrEmpty(lastUpdateTime))
+                return DateTime.Now;
+
+            if (DateTime.TryParse(lastUpdateTime.Replace("-", " "), out var timestamp))
+                return timestamp;
+
+            return DateTime.Now;
         }
 
         #endregion
@@ -395,67 +453,19 @@ namespace StockNotificationApi.Services
                     return null;
                 }
 
-                var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.Clear();
-                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-                client.DefaultRequestHeaders.Add("Referer", "https://www.bseindia.com");
-
+                var client = CreateHttpClientWithHeaders("https://www.bseindia.com");
                 var url = $"https://api.bseindia.com/BseIndiaAPI/api/StockReachData/w?scripcode={scripCode}";
+
                 _logger.LogDebug("BSE URL: {Url}", url);
 
                 var response = await client.GetAsync(url);
 
                 if (response.IsSuccessStatusCode)
                 {
-                    var content = await response.Content.ReadAsStringAsync();
-                    _logger.LogDebug("BSE Response: {Content}", content);
-
-                    if (!content.Contains("Error Code"))
-                    {
-                        var options = new JsonSerializerOptions
-                        {
-                            PropertyNameCaseInsensitive = true
-                        };
-
-                        var data = JsonSerializer.Deserialize<BSEQuoteResponse>(content, options);
-                        if (data != null)
-                        {
-                            _logger.LogInformation("BSE API successful for {Symbol}", symbol);
-
-                            return new StockData
-                            {
-                                Symbol = symbol,
-                                Name = data.CompanyName ?? symbol,
-                                Exchange = "BSE",
-                                Price = data.CurrentPrice,
-                                Change = data.Change,
-                                ChangePercent = data.PercentChange,
-                                Open = data.Open,
-                                DayHigh = data.DayHigh,
-                                DayLow = data.DayLow,
-                                PreviousClose = data.PreviousClose,
-                                Volume = data.Volume,
-                                YearHigh = data.YearHigh,
-                                YearLow = data.YearLow,
-                                MarketCap = data.MarketCap,
-                                PE = data.PE,
-                                FaceValue = data.FaceValue,
-                                Industry = data.Industry,
-                                Timestamp = data.UpdatedAt == DateTime.MinValue ? DateTime.Now : data.UpdatedAt
-                            };
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogWarning("BSE API returned error for {Symbol}: {Content}", symbol, content);
-                    }
-                }
-                else
-                {
-                    _logger.LogWarning("BSE API returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
+                    return await ParseBSEResponse(response, symbol);
                 }
 
+                _logger.LogWarning("BSE API returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
                 MarkApiRateLimited("BSE", FREE_API_COOLDOWN);
             }
             catch (Exception ex)
@@ -465,6 +475,51 @@ namespace StockNotificationApi.Services
             }
 
             return null;
+        }
+
+        private async Task<StockData?> ParseBSEResponse(HttpResponseMessage response, string symbol)
+        {
+            var content = await response.Content.ReadAsStringAsync();
+            _logger.LogDebug("BSE Response: {Content}", content);
+
+            if (content.Contains("Error Code"))
+            {
+                _logger.LogWarning("BSE API returned error for {Symbol}: {Content}", symbol, content);
+                return null;
+            }
+
+            var options = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            };
+
+            var data = JsonSerializer.Deserialize<BSEQuoteResponse>(content, options);
+            if (data == null)
+                return null;
+
+            _logger.LogInformation("BSE API successful for {Symbol}", symbol);
+
+            return new StockData
+            {
+                Symbol = symbol,
+                Name = data.CompanyName ?? symbol,
+                Exchange = "BSE",
+                Price = data.CurrentPrice,
+                Change = data.Change,
+                ChangePercent = data.PercentChange,
+                Open = data.Open,
+                DayHigh = data.DayHigh,
+                DayLow = data.DayLow,
+                PreviousClose = data.PreviousClose,
+                Volume = data.Volume,
+                YearHigh = data.YearHigh,
+                YearLow = data.YearLow,
+                MarketCap = data.MarketCap,
+                PE = data.PE,
+                FaceValue = data.FaceValue,
+                Industry = data.Industry,
+                Timestamp = data.UpdatedAt == DateTime.MinValue ? DateTime.Now : data.UpdatedAt
+            };
         }
 
         private string GetBSEScripCode(string symbol)
@@ -498,7 +553,7 @@ namespace StockNotificationApi.Services
                 ["ONGC"] = "500312"
             };
 
-            return mapping.ContainsKey(symbol.ToUpper()) ? mapping[symbol.ToUpper()] : string.Empty;
+            return mapping.TryGetValue(symbol.ToUpper(), out var code) ? code : string.Empty;
         }
 
         #endregion
@@ -511,61 +566,20 @@ namespace StockNotificationApi.Services
             {
                 _logger.LogInformation("Trying Yahoo Finance for {Symbol}", symbol);
 
-                var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.Clear();
-                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                var client = CreateHttpClientWithHeaders();
+                var cleanSymbol = symbol.Replace(".NS", "").Replace(".BO", "");
+                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/{cleanSymbol}.NS?region=IN&lang=en-IN";
 
-                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?region=IN&lang=en-IN";
                 _logger.LogDebug("Yahoo URL: {Url}", url);
 
                 var response = await client.GetAsync(url);
 
                 if (response.IsSuccessStatusCode)
                 {
-                    var content = await response.Content.ReadAsStringAsync();
-                    _logger.LogDebug("Yahoo Response received, length: {Length}", content.Length);
-
-                    var options = new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true
-                    };
-
-                    var data = JsonSerializer.Deserialize<YahooFinanceResponse>(content, options);
-
-                    var quote = data?.Chart?.Result?.FirstOrDefault()?.Meta;
-                    if (quote != null)
-                    {
-                        _logger.LogInformation("Yahoo Finance successful for {Symbol}", symbol);
-
-                        var price = quote.RegularMarketPrice ?? 0;
-                        var prevClose = quote.PreviousClose ?? price;
-                        var change = price - prevClose;
-                        var changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0;
-
-                        return new StockData
-                        {
-                            Symbol = symbol.Replace(".NS", "").Replace(".BO", ""),
-                            Name = symbol.Replace(".NS", "").Replace(".BO", ""),
-                            Exchange = symbol.Contains(".BO") ? "BSE" : "NSE",
-                            Price = price,
-                            Change = change,
-                            ChangePercent = changePercent,
-                            DayHigh = quote.RegularMarketDayHigh ?? price * 1.02m,
-                            DayLow = quote.RegularMarketDayLow ?? price * 0.98m,
-                            Open = quote.RegularMarketOpen ?? price,
-                            PreviousClose = prevClose,
-                            Volume = quote.RegularMarketVolume ?? 0,
-                            YearHigh = price * 1.2m,
-                            YearLow = price * 0.8m,
-                            Timestamp = DateTime.Now
-                        };
-                    }
-                }
-                else
-                {
-                    _logger.LogWarning("Yahoo Finance returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
+                    return await ParseYahooResponse(response, symbol);
                 }
 
+                _logger.LogWarning("Yahoo Finance returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
                 MarkApiRateLimited("Yahoo", YAHOO_COOLDOWN);
             }
             catch (Exception ex)
@@ -577,6 +591,70 @@ namespace StockNotificationApi.Services
             return null;
         }
 
+        private async Task<StockData?> ParseYahooResponse(HttpResponseMessage response, string symbol)
+        {
+            var content = await response.Content.ReadAsStringAsync();
+            _logger.LogDebug("Yahoo Response received, length: {Length}", content.Length);
+
+            var options = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            };
+
+            var data = JsonSerializer.Deserialize<YahooFinanceResponse>(content, options);
+            var quote = data?.Chart?.Result?.FirstOrDefault()?.Meta;
+
+            if (quote == null)
+                return null;
+
+            _logger.LogInformation("Yahoo Finance successful for {Symbol}", symbol);
+
+            var price = quote.RegularMarketPrice ?? 0;
+            var prevClose = quote.PreviousClose ?? price;
+            var change = price - prevClose;
+            var changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0;
+
+            return new StockData
+            {
+                Symbol = symbol.Replace(".NS", "").Replace(".BO", ""),
+                Name = symbol.Replace(".NS", "").Replace(".BO", ""),
+                Exchange = symbol.Contains(".BO") ? "BSE" : "NSE",
+                Price = price,
+                Change = change,
+                ChangePercent = changePercent,
+                DayHigh = quote.RegularMarketDayHigh ?? price * DEFAULT_DAY_HIGH_MULTIPLIER,
+                DayLow = quote.RegularMarketDayLow ?? price * DEFAULT_DAY_LOW_MULTIPLIER,
+                Open = quote.RegularMarketOpen ?? price,
+                PreviousClose = prevClose,
+                Volume = quote.RegularMarketVolume ?? 0,
+                YearHigh = price * DEFAULT_YEAR_HIGH_MULTIPLIER,
+                YearLow = price * DEFAULT_YEAR_LOW_MULTIPLIER,
+                Timestamp = DateTime.Now
+            };
+        }
+
         #endregion
-    }    
+
+        #region Helper Methods
+
+        private HttpClient CreateHttpClientWithHeaders(string? referer = null)
+        {
+            var client = _httpClientFactory.CreateClient();
+            client.DefaultRequestHeaders.Clear();
+            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+            client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
+
+            if (!string.IsNullOrEmpty(referer))
+            {
+                client.DefaultRequestHeaders.Add("Referer", referer);
+            }
+
+            client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
+
+            return client;
+        }
+
+        #endregion
+    }
 }

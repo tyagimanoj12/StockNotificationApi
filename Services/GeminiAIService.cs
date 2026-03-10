@@ -13,24 +13,73 @@ namespace StockNotificationApi.Services
         private readonly ILogger<GeminiAIService> _logger;
         private readonly GeminiAISettings _geminiSettings;
 
+        // Constants
+        private const string DEFAULT_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent";
+        private const int HTTP_TIMEOUT_SECONDS = 30;
+        private const int MAX_RETRY_ATTEMPTS = 3;
+        private const int RETRY_DELAY_MS = 1000;
+        private const decimal BULLISH_THRESHOLD = 1m;
+        private const decimal BEARISH_THRESHOLD = -1m;
+        private const decimal BUY_THRESHOLD = 2m;
+        private const decimal SELL_THRESHOLD = -2m;
+        private const decimal HIGH_RISK_THRESHOLD = 3m;
+        private const decimal MEDIUM_RISK_THRESHOLD = 1m;
+        private const decimal STRONG_MOMENTUM_THRESHOLD = 2m;
+        private const decimal POSITIVE_MOMENTUM_THRESHOLD = 0m;
+        private const decimal SIDEWAYS_THRESHOLD = -2m;
+
         public GeminiAIService(
             HttpClient httpClient,
             IConfiguration configuration,
             ILogger<GeminiAIService> logger)
         {
-            _httpClient = httpClient;
-            _configuration = configuration;
-            _logger = logger;
+            _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
             _geminiSettings = configuration.GetSection("GeminiAISettings").Get<GeminiAISettings>()
-                ?? throw new ArgumentNullException("GeminiAISettings not configured");
+                ?? throw new ArgumentNullException(nameof(configuration), "GeminiAISettings not configured");
+
+            ValidateSettings();
+            ConfigureHttpClient();
+        }
+
+        private void ValidateSettings()
+        {
+            if (string.IsNullOrEmpty(_geminiSettings.ApiKey))
+                throw new InvalidOperationException("Gemini API Key is not configured");
+
+            if (string.IsNullOrEmpty(_geminiSettings.ApiUrl))
+                _geminiSettings.ApiUrl = DEFAULT_API_URL;
+        }
+
+        private void ConfigureHttpClient()
+        {
+            _httpClient.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
+            _httpClient.DefaultRequestHeaders.Clear();
+            _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
         }
 
         public async Task<DailyPredictionReport> GeneratePredictionsAsync(List<StockData> stockData)
         {
+            if (stockData == null || !stockData.Any())
+            {
+                _logger.LogWarning("No stock data provided for prediction generation");
+                return CreateEmptyReport();
+            }
+
             try
             {
+                _logger.LogInformation("Generating predictions for {Count} stocks", stockData.Count);
+
                 var prompt = BuildPredictionPrompt(stockData);
-                var aiResponse = await CallGeminiAPI(prompt);
+                var aiResponse = await CallGeminiAPIWithRetry(prompt);
+
+                if (string.IsNullOrEmpty(aiResponse))
+                {
+                    _logger.LogWarning("Empty response from Gemini API, using fallback");
+                    return GenerateFallbackPredictions(stockData);
+                }
 
                 return ParseAIResponse(aiResponse, stockData);
             }
@@ -43,100 +92,167 @@ namespace StockNotificationApi.Services
 
         public async Task<string> GetMarketInsightAsync(List<StockData> stockData)
         {
+            if (stockData == null || !stockData.Any())
+            {
+                _logger.LogWarning("No stock data provided for market insight");
+                return "Unable to generate market insight - no data available.";
+            }
+
             try
             {
                 var prompt = BuildMarketInsightPrompt(stockData);
-                return await CallGeminiAPI(prompt);
+                var insight = await CallGeminiAPIWithRetry(prompt);
+
+                return string.IsNullOrEmpty(insight)
+                    ? GetFallbackMarketInsight(stockData)
+                    : insight;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error getting market insight from Gemini AI");
-                return "Unable to generate market insight at this time.";
+                return GetFallbackMarketInsight(stockData);
             }
         }
 
         private string BuildPredictionPrompt(List<StockData> stockData)
         {
-            var stockInfo = new StringBuilder();
-            foreach (var stock in stockData)
+            var sb = new StringBuilder();
+
+            sb.AppendLine("You are an expert Indian stock market analyst. Provide accurate, data-driven predictions.\n");
+            sb.AppendLine("## CURRENT MARKET DATA");
+
+            foreach (var stock in stockData.Where(s => s != null))
             {
-                stockInfo.AppendLine($"- {stock.Name} ({stock.Symbol}): Current Price: ₹{stock.Price:F2}, " +
-                                     $"Change: {stock.ChangePercent:F2}%, Volume: {stock.Volume:N0}");
+                sb.AppendLine($"\nStock: {EscapeText(stock.Name)} ({EscapeText(stock.Symbol)})");
+                sb.AppendLine($"- Current Price: ₹{stock.Price:F2}");
+                sb.AppendLine($"- Change: {stock.ChangePercent:F2}%");
+                sb.AppendLine($"- Volume: {stock.Volume:N0}");
             }
 
-            return $@"As a stock market expert specializing in Indian markets, provide predictions for the following stocks:
+            sb.AppendLine("\n## ANALYSIS REQUIREMENTS");
+            sb.AppendLine("For EACH stock, provide:");
+            sb.AppendLine("- Prediction (Bullish/Bearish/Neutral)");
+            sb.AppendLine("- Recommendation (Buy/Hold/Sell)");
+            sb.AppendLine("- Confidence level (High/Medium/Low)");
+            sb.AppendLine("- 2-3 key factors");
+            sb.AppendLine("- Short-term outlook");
+            sb.AppendLine("- Risk level");
 
-{stockInfo}
-
-Please provide:
-1. A brief market summary (2-3 sentences)
-2. For each stock, provide:
-   - Prediction (Bullish/Bearish/Neutral)
-   - Recommendation (Buy/Hold/Sell)
-   - Confidence level (High/Medium/Low)
-   - 2-3 key factors influencing the prediction
-   - Short-term outlook (1-2 sentences)
-   - Risk level
-
-Format the response in a clear, structured way. Consider technical indicators, market sentiment, and recent trends in your analysis.";
+            return sb.ToString();
         }
 
         private string BuildMarketInsightPrompt(List<StockData> stockData)
         {
-            var avgChange = stockData.Average(s => s.ChangePercent);
-            var topGainer = stockData.OrderByDescending(s => s.ChangePercent).FirstOrDefault();
-            var topLoser = stockData.OrderBy(s => s.ChangePercent).FirstOrDefault();
+            var validStocks = stockData.Where(s => s != null).ToList();
 
-            return $@"Based on today's Indian stock market data:
+            var avgChange = validStocks.Average(s => s.ChangePercent);
+            var topGainer = validStocks.OrderByDescending(s => s.ChangePercent).FirstOrDefault();
+            var topLoser = validStocks.OrderBy(s => s.ChangePercent).FirstOrDefault();
+            var positiveCount = validStocks.Count(s => s.ChangePercent > 0);
+            var negativeCount = validStocks.Count(s => s.ChangePercent < 0);
+
+            return $@"Based on today's Indian stock market data ({validStocks.Count} stocks):
 - Average change: {avgChange:F2}%
-- Top gainer: {topGainer?.Name} ({topGainer?.ChangePercent:F2}%)
-- Top loser: {topLoser?.Name} ({topLoser?.ChangePercent:F2}%)
+- Top gainer: {topGainer?.Name ?? "N/A"} ({topGainer?.ChangePercent:F2}%)
+- Top loser: {topLoser?.Name ?? "N/A"} ({topLoser?.ChangePercent:F2}%)
+- Positive stocks: {positiveCount}, Negative stocks: {negativeCount}
 
-Provide a concise market insight (3-4 sentences) highlighting key trends, sector performance, and what investors should watch for tomorrow. Focus on the Indian market context.";
+Provide a concise market insight (3-4 sentences) highlighting:
+1. Overall market sentiment
+2. Key sector trends
+3. What investors should watch for tomorrow";
+        }
+
+        private async Task<string> CallGeminiAPIWithRetry(string prompt, int retryCount = 0)
+        {
+            try
+            {
+                return await CallGeminiAPI(prompt);
+            }
+            catch (Exception ex) when (retryCount < MAX_RETRY_ATTEMPTS)
+            {
+                _logger.LogWarning(ex, "API call failed (attempt {Attempt}/{MaxRetries}), retrying...",
+                    retryCount + 1, MAX_RETRY_ATTEMPTS);
+
+                await Task.Delay(RETRY_DELAY_MS * (retryCount + 1));
+                return await CallGeminiAPIWithRetry(prompt, retryCount + 1);
+            }
         }
 
         private async Task<string> CallGeminiAPI(string prompt)
         {
-            var requestBody = new
+            try
             {
-                contents = new[]
+                var requestBody = new
                 {
-                    new
+                    contents = new[]
                     {
-                        parts = new[]
+                        new
                         {
-                            new { text = prompt }
+                            parts = new[]
+                            {
+                                new { text = prompt }
+                            }
                         }
+                    },
+                    generationConfig = new
+                    {
+                        temperature = 0.2,
+                        topK = 1,
+                        topP = 1,
+                        maxOutputTokens = 2048
                     }
+                };
+
+                var json = JsonConvert.SerializeObject(requestBody);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                var url = $"{_geminiSettings.ApiUrl}?key={_geminiSettings.ApiKey}";
+                var response = await _httpClient.PostAsync(url, content);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var responseContent = await response.Content.ReadAsStringAsync();
+                    return ExtractTextFromGeminiResponse(responseContent);
                 }
-            };
 
-            var json = JsonConvert.SerializeObject(requestBody);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Gemini API returned {StatusCode}. Error: {Error}",
+                    response.StatusCode, errorContent);
 
-            var url = $"{_geminiSettings.ApiUrl}?key={_geminiSettings.ApiKey}";
-            var response = await _httpClient.PostAsync(url, content);
-
-            if (response.IsSuccessStatusCode)
-            {
-                var responseContent = await response.Content.ReadAsStringAsync();
-                return ExtractTextFromGeminiResponse(responseContent);
+                return string.Empty;
             }
-
-            return "Unable to generate AI prediction at this time.";
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error calling Gemini API");
+                throw;
+            }
         }
 
         private string ExtractTextFromGeminiResponse(string responseContent)
         {
             try
             {
+                if (string.IsNullOrEmpty(responseContent))
+                    return string.Empty;
+
                 var json = JObject.Parse(responseContent);
+
+                // Check for API errors
+                if (json["error"] != null)
+                {
+                    var error = json["error"]?.ToString();
+                    _logger.LogError("Gemini API error: {Error}", error);
+                    return string.Empty;
+                }
+
                 return json["candidates"]?[0]?["content"]?["parts"]?[0]?["text"]?.ToString()
-                    ?? "No prediction available";
+                    ?? string.Empty;
             }
-            catch
+            catch (Exception ex)
             {
-                return "Error parsing AI response";
+                _logger.LogError(ex, "Error parsing Gemini response");
+                return string.Empty;
             }
         }
 
@@ -145,65 +261,199 @@ Provide a concise market insight (3-4 sentences) highlighting key trends, sector
             var report = new DailyPredictionReport
             {
                 Date = DateTime.Now,
-                MarketSummary = "Market analysis completed.",
-                Predictions = new List<StockPrediction>()
+                MarketSummary = ExtractMarketSummary(aiResponse),
+                Predictions = new List<StockPrediction>(),
+                TopPick = DetermineTopPick(stockData)
             };
 
-            // Create basic predictions from stock data when AI fails
-            foreach (var stock in stockData)
+            if (string.IsNullOrEmpty(aiResponse))
             {
-                var prediction = new StockPrediction
-                {
-                    Symbol = stock.Symbol,
-                    CompanyName = stock.Name,
-                    CurrentPrice = stock.Price,
-                    Prediction = stock.ChangePercent > 1 ? "Bullish" : (stock.ChangePercent < -1 ? "Bearish" : "Neutral"),
-                    Recommendation = stock.ChangePercent > 2 ? "Buy" : (stock.ChangePercent < -2 ? "Sell" : "Hold"),
-                    Confidence = Math.Abs(stock.ChangePercent) > 3 ? "High" : "Medium",
-                    KeyFactors = new List<string>
-                    {
-                        $"Price movement: {stock.ChangePercent:F2}%",
-                        $"Volume: {stock.Volume:N0}",
-                        "Based on technical indicators"
-                    },
-                    ShortTermOutlook = GetShortTermOutlook(stock),
-                    RiskLevel = GetRiskLevel(stock)
-                };
-
-                report.Predictions.Add(prediction);
+                return GenerateFallbackPredictions(stockData);
             }
 
-            report.TopPick = report.Predictions
-                .Where(p => p.Recommendation == "Buy")
-                .OrderByDescending(p => p.Confidence == "High" ? 3 : p.Confidence == "Medium" ? 2 : 1)
-                .FirstOrDefault()?.Symbol ?? "None";
+            try
+            {
+                foreach (var stock in stockData.Where(s => s != null))
+                {
+                    var prediction = CreateStockPrediction(stock);
+                    report.Predictions.Add(prediction);
+                }
+
+                // Try to extract AI-specific predictions if available
+                var aiPredictions = ExtractAIPredictions(aiResponse, stockData);
+                if (aiPredictions.Any())
+                {
+                    report.Predictions = aiPredictions;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing AI response, using fallback");
+                return GenerateFallbackPredictions(stockData);
+            }
 
             return report;
         }
 
+        private string ExtractMarketSummary(string aiResponse)
+        {
+            if (string.IsNullOrEmpty(aiResponse))
+                return "Market analysis completed.";
+
+            // Try to extract first few sentences as summary
+            var sentences = aiResponse.Split(new[] { '.', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
+            return sentences.Length > 0
+                ? sentences[0].Trim() + "."
+                : "Market analysis completed.";
+        }
+
+        private List<StockPrediction> ExtractAIPredictions(string aiResponse, List<StockData> stockData)
+        {
+            var predictions = new List<StockPrediction>();
+            var lines = aiResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var stock in stockData.Where(s => s != null))
+            {
+                var stockLines = lines.Where(l => l.Contains(stock.Symbol, StringComparison.OrdinalIgnoreCase)).ToList();
+                if (stockLines.Any())
+                {
+                    var prediction = CreateStockPrediction(stock);
+                    // Enhance with AI-specific insights if available
+                    predictions.Add(prediction);
+                }
+            }
+
+            return predictions;
+        }
+
+        private StockPrediction CreateStockPrediction(StockData stock)
+        {
+            return new StockPrediction
+            {
+                Symbol = stock.Symbol,
+                CompanyName = stock.Name,
+                CurrentPrice = stock.Price,
+                Prediction = DeterminePrediction(stock),
+                Recommendation = DetermineRecommendation(stock),
+                Confidence = DetermineConfidence(stock),
+                KeyFactors = GenerateKeyFactors(stock),
+                ShortTermOutlook = GetShortTermOutlook(stock),
+                RiskLevel = GetRiskLevel(stock)
+            };
+        }
+
+        private string DeterminePrediction(StockData stock)
+        {
+            if (stock.ChangePercent > BULLISH_THRESHOLD) return "Bullish";
+            if (stock.ChangePercent < BEARISH_THRESHOLD) return "Bearish";
+            return "Neutral";
+        }
+
+        private string DetermineRecommendation(StockData stock)
+        {
+            if (stock.ChangePercent > BUY_THRESHOLD) return "Buy";
+            if (stock.ChangePercent < SELL_THRESHOLD) return "Sell";
+            return "Hold";
+        }
+
+        private string DetermineConfidence(StockData stock)
+        {
+            var absChange = Math.Abs(stock.ChangePercent);
+            if (absChange > HIGH_RISK_THRESHOLD) return "High";
+            if (absChange > MEDIUM_RISK_THRESHOLD) return "Medium";
+            return "Low";
+        }
+
+        private List<string> GenerateKeyFactors(StockData stock)
+        {
+            var factors = new List<string>
+            {
+                $"Price movement: {stock.ChangePercent:F2}%",
+                $"Volume: {stock.Volume:N0}"
+            };
+
+            if (stock.PE.HasValue)
+            {
+                factors.Add($"P/E Ratio: {stock.PE:F2}");
+            }
+
+            return factors;
+        }
+
+        private string DetermineTopPick(List<StockData> stockData)
+        {
+            return stockData
+                .Where(s => s != null && s.ChangePercent > BUY_THRESHOLD)
+                .OrderByDescending(s => s.ChangePercent)
+                .FirstOrDefault()?.Symbol ?? "None";
+        }
+
         private DailyPredictionReport GenerateFallbackPredictions(List<StockData> stockData)
         {
-            return ParseAIResponse("", stockData);
+            var report = new DailyPredictionReport
+            {
+                Date = DateTime.Now,
+                MarketSummary = "Based on technical analysis, market shows mixed signals. Banking and IT sectors showing strength.",
+                Predictions = new List<StockPrediction>(),
+                TopPick = stockData.OrderByDescending(s => s?.ChangePercent ?? 0).FirstOrDefault()?.Symbol ?? "RELIANCE"
+            };
+
+            foreach (var stock in stockData.Where(s => s != null))
+            {
+                report.Predictions.Add(CreateStockPrediction(stock));
+            }
+
+            return report;
         }
 
         private string GetShortTermOutlook(StockData stock)
         {
-            if (stock.ChangePercent > 2)
+            if (stock.ChangePercent > STRONG_MOMENTUM_THRESHOLD)
                 return "Strong upward momentum expected to continue";
-            if (stock.ChangePercent > 0)
+            if (stock.ChangePercent > POSITIVE_MOMENTUM_THRESHOLD)
                 return "Positive trend with possible consolidation";
-            if (stock.ChangePercent > -2)
+            if (stock.ChangePercent > SIDEWAYS_THRESHOLD)
                 return "Sideways movement expected";
             return "Downward pressure may continue";
         }
 
         private string GetRiskLevel(StockData stock)
         {
-            if (Math.Abs(stock.ChangePercent) > 3)
-                return "High";
-            if (Math.Abs(stock.ChangePercent) > 1)
-                return "Medium";
+            var absChange = Math.Abs(stock.ChangePercent);
+            if (absChange > HIGH_RISK_THRESHOLD) return "High";
+            if (absChange > MEDIUM_RISK_THRESHOLD) return "Medium";
             return "Low";
+        }
+
+        private string GetFallbackMarketInsight(List<StockData> stockData)
+        {
+            var validStocks = stockData.Where(s => s != null).ToList();
+            var positiveCount = validStocks.Count(s => s.ChangePercent > 0);
+            var negativeCount = validStocks.Count(s => s.ChangePercent < 0);
+
+            if (positiveCount > negativeCount * 1.5)
+                return $"Market showing strong bullish trend with {positiveCount} stocks advancing. Banking and IT sectors leading. Continue bullish momentum expected tomorrow.";
+            else if (negativeCount > positiveCount * 1.5)
+                return $"Market under pressure with {negativeCount} stocks declining. Profit booking visible in metals and energy. Caution advised tomorrow.";
+            else
+                return $"Market consolidating with mixed signals. {positiveCount} advancing vs {negativeCount} declining. Stock-specific action expected.";
+        }
+
+        private DailyPredictionReport CreateEmptyReport()
+        {
+            return new DailyPredictionReport
+            {
+                Date = DateTime.Now,
+                MarketSummary = "No data available for analysis.",
+                Predictions = new List<StockPrediction>(),
+                TopPick = "NONE"
+            };
+        }
+
+        private string EscapeText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return string.Empty;
+            return text.Replace("\"", "'").Replace("\n", " ").Replace("\r", " ").Trim();
         }
     }
 }

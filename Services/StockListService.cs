@@ -11,13 +11,22 @@ namespace StockNotificationApi.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<StockListService> _logger;
         private readonly IMemoryCache _cache;
+        private readonly IServiceScopeFactory _scopeFactory;
+
+        // Constants
+        private const int LARGE_CAP_THRESHOLD = 20000;
+        private const int MID_CAP_THRESHOLD = 5000;
+        private const int DEFAULT_STOCK_COUNT = 200;
+        private const int PROCESSING_BATCH_SIZE = 20;
+        private const int API_RATE_LIMIT_DELAY_MS = 200;
+        private const int CACHE_DURATION_HOURS = 6;
+        private const int FNO_LIST_SIZE = 100;
+        private const int HTTP_TIMEOUT_SECONDS = 30;
 
         private static List<StockInfo> _cachedNSEStocks = new();
         private static List<string> _cachedFNOSymbols = new();
         private static DateTime _lastRefresh = DateTime.MinValue;
-        private static readonly TimeSpan RefreshInterval = TimeSpan.FromHours(6); // Refresh every 6 hours
-        private readonly IServiceScopeFactory _scopeFactory; // Add this
-
+        private static readonly TimeSpan RefreshInterval = TimeSpan.FromHours(CACHE_DURATION_HOURS);
 
         public StockListService(
             IHttpClientFactory httpClientFactory,
@@ -25,10 +34,10 @@ namespace StockNotificationApi.Services
             IMemoryCache cache,
             IServiceScopeFactory scopeFactory)
         {
-            _httpClientFactory = httpClientFactory;
-            _logger = logger;
-            _cache = cache;
-            _scopeFactory = scopeFactory;
+            _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         }
 
         public async Task<List<StockInfo>> GetNSEStocksAsync()
@@ -37,85 +46,81 @@ namespace StockNotificationApi.Services
             if (_cachedNSEStocks.Any() && DateTime.UtcNow - _lastRefresh < RefreshInterval)
             {
                 _logger.LogInformation("Returning {Count} cached NSE stocks", _cachedNSEStocks.Count);
-                return _cachedNSEStocks;
+                return new List<StockInfo>(_cachedNSEStocks); // Return a copy to prevent modification
             }
 
             await RefreshStockListAsync();
-            return _cachedNSEStocks;
+            return new List<StockInfo>(_cachedNSEStocks);
         }
 
         public async Task<List<StockInfo>> GetBSEStocksAsync()
         {
-            // For now, return empty list or you can implement BSE later
             _logger.LogWarning("BSE API not yet implemented");
             return new List<StockInfo>();
         }
 
-        //public async Task<List<StockInfo>> GetTopStocksByMarketCapAsync(int count = 50)
-        //{
-        //    var allStocks = await GetNSEStocksAsync();
-
-        //    // Return the first 'count' stocks (the list is ordered by trading activity)
-        //    return allStocks
-        //        .Where(s => !string.IsNullOrEmpty(s.Symbol))
-        //        .Take(count)
-        //        .ToList();
-        //}
-
-        //public async Task<List<StockInfo>> GetTopStocksByMarketCapAsync(int count = 50)
-        //{
-        //    // Try to get from cache first
-        //    var cacheKey = "TopStocksByMarketCap";
-        //    if (_cache.TryGetValue(cacheKey, out List<StockInfo>? cached) && cached != null)
-        //    {
-        //        return cached.Take(count).ToList();
-        //    }
-
-        //    // Get enriched stocks with market cap data
-        //    var enrichedStocks = await GetStocksWithMarketCapAsync(200);
-
-        //    // Cache for 6 hours
-        //    _cache.Set(cacheKey, enrichedStocks, TimeSpan.FromHours(6));
-
-        //    return enrichedStocks.Take(count).ToList();
-        //}
         public async Task<List<StockInfo>> GetTopStocksByMarketCapAsync(int count = 50)
         {
-            var stocksWithCap = await GetStocksWithMarketCapAsync(200);
+            if (count <= 0)
+            {
+                _logger.LogWarning("Invalid count requested: {Count}", count);
+                return new List<StockInfo>();
+            }
+
+            var stocksWithCap = await GetStocksWithMarketCapAsync(DEFAULT_STOCK_COUNT);
             return stocksWithCap.Take(count).ToList();
         }
+
         public async Task<List<StockInfo>> GetLargeCapStocksAsync(int count = 20)
         {
-            var stocks = await GetStocksWithMarketCapAsync(200);
-            return stocks.Where(s => s.MarketCap >= 20000).Take(count).ToList();
+            if (count <= 0) return new List<StockInfo>();
+
+            var stocks = await GetStocksWithMarketCapAsync(DEFAULT_STOCK_COUNT);
+            return stocks.Where(s => s.MarketCap >= LARGE_CAP_THRESHOLD)
+                        .Take(count)
+                        .ToList();
         }
 
         public async Task<List<StockInfo>> GetMidCapStocksAsync(int count = 20)
         {
-            var stocks = await GetStocksWithMarketCapAsync(200);
-            return stocks.Where(s => s.MarketCap >= 5000 && s.MarketCap < 20000).Take(count).ToList();
+            if (count <= 0) return new List<StockInfo>();
+
+            var stocks = await GetStocksWithMarketCapAsync(DEFAULT_STOCK_COUNT);
+            return stocks.Where(s => s.MarketCap >= MID_CAP_THRESHOLD && s.MarketCap < LARGE_CAP_THRESHOLD)
+                        .Take(count)
+                        .ToList();
         }
 
         public async Task<List<StockInfo>> GetSmallCapStocksAsync(int count = 20)
         {
-            var stocks = await GetStocksWithMarketCapAsync(200);
-            return stocks.Where(s => s.MarketCap < 5000).Take(count).ToList();
+            if (count <= 0) return new List<StockInfo>();
+
+            var stocks = await GetStocksWithMarketCapAsync(DEFAULT_STOCK_COUNT);
+            return stocks.Where(s => s.MarketCap < MID_CAP_THRESHOLD)
+                        .Take(count)
+                        .ToList();
         }
 
         public async Task<Dictionary<string, List<StockInfo>>> GetAllCategoriesAsync()
         {
-            var stocks = await GetStocksWithMarketCapAsync(200);
+            var stocks = await GetStocksWithMarketCapAsync(DEFAULT_STOCK_COUNT);
 
             return new Dictionary<string, List<StockInfo>>
             {
-                ["LargeCap"] = stocks.Where(s => s.MarketCap >= 20000).ToList(),
-                ["MidCap"] = stocks.Where(s => s.MarketCap >= 5000 && s.MarketCap < 20000).ToList(),
-                ["SmallCap"] = stocks.Where(s => s.MarketCap < 5000).ToList()
+                ["LargeCap"] = stocks.Where(s => s.MarketCap >= LARGE_CAP_THRESHOLD).ToList(),
+                ["MidCap"] = stocks.Where(s => s.MarketCap >= MID_CAP_THRESHOLD && s.MarketCap < LARGE_CAP_THRESHOLD).ToList(),
+                ["SmallCap"] = stocks.Where(s => s.MarketCap < MID_CAP_THRESHOLD).ToList()
             };
         }
-        // In StockListService.cs
+
         public async Task<List<StockInfo>> GetStocksWithMarketCapAsync(int count = 100)
         {
+            if (count <= 0)
+            {
+                _logger.LogWarning("Invalid count requested: {Count}", count);
+                return new List<StockInfo>();
+            }
+
             _logger.LogInformation("Getting stocks with market cap data...");
 
             // Check cache first
@@ -128,15 +133,22 @@ namespace StockNotificationApi.Services
 
             // Get all stock symbols
             var allStocks = await GetNSEStocksAsync();
-            var enrichedStocks = new List<StockInfo>();
+            if (!allStocks.Any())
+            {
+                _logger.LogWarning("No NSE stocks available for enrichment");
+                return new List<StockInfo>();
+            }
 
+            var enrichedStocks = new List<StockInfo>();
             _logger.LogInformation("Enriching {Total} stocks with market cap data...", allStocks.Count);
 
             int processed = 0;
-            foreach (var stock in allStocks.Take(200)) // Process top 200
+            foreach (var stock in allStocks.Take(DEFAULT_STOCK_COUNT))
             {
                 try
                 {
+                    if (stock?.Symbol == null) continue;
+
                     // Create a scope to get StockService
                     using var scope = _scopeFactory.CreateScope();
                     var stockService = scope.ServiceProvider.GetRequiredService<IStockService>();
@@ -146,25 +158,31 @@ namespace StockNotificationApi.Services
 
                     if (stockData != null && stockData.MarketCap > 0)
                     {
-                        stock.MarketCap = stockData.MarketCap;
-                        stock.Sector = stockData.Sector;
-                        stock.Industry = stockData.Industry;
-                        stock.CompanyName = stockData.Name;
-                        enrichedStocks.Add(stock);
+                        var enrichedStock = new StockInfo
+                        {
+                            Symbol = stock.Symbol,
+                            CompanyName = stockData.Name,
+                            Exchange = "NSE",
+                            Sector = stockData.Sector,
+                            Industry = stockData.Industry,
+                            MarketCap = stockData.MarketCap,
+                            IsFNOSec = IsLikelyFNOSymbol(stock.Symbol)
+                        };
+                        enrichedStocks.Add(enrichedStock);
                     }
 
                     processed++;
-                    if (processed % 20 == 0)
+                    if (processed % PROCESSING_BATCH_SIZE == 0)
                     {
                         _logger.LogInformation("Processed {Processed}/{Total} stocks", processed, allStocks.Count);
                     }
 
-                    // Rate limiting - don't overwhelm the API
-                    await Task.Delay(200);
+                    // Rate limiting
+                    await Task.Delay(API_RATE_LIMIT_DELAY_MS);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to get market cap for {Symbol}", stock.Symbol);
+                    _logger.LogWarning(ex, "Failed to get market cap for {Symbol}", stock?.Symbol);
                 }
             }
 
@@ -177,19 +195,28 @@ namespace StockNotificationApi.Services
             _logger.LogInformation("Successfully enriched {Count} stocks with market cap data", sortedStocks.Count);
 
             // Cache for 6 hours
-            _cache.Set(cacheKey, sortedStocks, TimeSpan.FromHours(6));
+            _cache.Set(cacheKey, sortedStocks, TimeSpan.FromHours(CACHE_DURATION_HOURS));
 
             return sortedStocks.Take(count).ToList();
         }
 
         public async Task<List<StockInfo>> GetStocksBySectorAsync(string sector)
         {
+            if (string.IsNullOrWhiteSpace(sector))
+            {
+                _logger.LogWarning("Empty sector provided");
+                return new List<StockInfo>();
+            }
+
             var allStocks = await GetNSEStocksAsync();
-            return allStocks.Where(s => s.Sector?.Contains(sector, StringComparison.OrdinalIgnoreCase) == true).ToList();
+            return allStocks.Where(s => s.Sector?.Contains(sector, StringComparison.OrdinalIgnoreCase) == true)
+                           .ToList();
         }
 
         public async Task<List<string>> GetFNOSymbolsAsync(int count = 50)
         {
+            if (count <= 0) return new List<string>();
+
             if (_cachedFNOSymbols.Any() && DateTime.UtcNow - _lastRefresh < RefreshInterval)
             {
                 return _cachedFNOSymbols.Take(count).ToList();
@@ -206,27 +233,8 @@ namespace StockNotificationApi.Services
                 _logger.LogInformation("Refreshing stock list from NSE master quote API...");
 
                 var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.Clear();
-                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-                client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
-                client.DefaultRequestHeaders.Add("Referer", "https://www.nseindia.com");
+                ConfigureHttpClient(client);
 
-                //// First get cookies from homepage
-                //_logger.LogDebug("Getting NSE cookies...");
-                //var homeResponse = await client.GetAsync("https://www.nseindia.com");
-
-                //if (!homeResponse.IsSuccessStatusCode)
-                //{
-                //    _logger.LogWarning("Failed to get NSE cookies, using fallback");
-                //    LoadFallbackStocks();
-                //    return;
-                //}
-
-                // Small delay to ensure cookies are set
-                //await Task.Delay(2000);
-
-                // Get the master quote list
                 _logger.LogInformation("Fetching master quote list...");
                 var url = "https://www.nseindia.com/api/master-quote";
                 var response = await client.GetAsync(url);
@@ -234,33 +242,11 @@ namespace StockNotificationApi.Services
                 if (response.IsSuccessStatusCode)
                 {
                     var content = await response.Content.ReadAsStringAsync();
-
-                    // Parse the JSON array directly to List<string>
-                    var symbols = JsonSerializer.Deserialize<List<string>>(content);
-
-                    if (symbols != null && symbols.Any())
-                    {
-                        _cachedNSEStocks = symbols.Select(s => new StockInfo
-                        {
-                            Symbol = s,
-                            CompanyName = GetCompanyName(s), // Enrich with company name
-                            Exchange = "NSE",
-                            Sector = GetSector(s),
-                            Industry = GetIndustry(s),
-                            IsFNOSec = IsLikelyFNOSymbol(s) // Mark likely F&O stocks
-                        }).ToList();
-
-                        _logger.LogInformation("Successfully loaded {Count} stocks from NSE master quote", _cachedNSEStocks.Count);
-
-                        // Store top 100 symbols for F&O list
-                        _cachedFNOSymbols = symbols.Take(100).ToList();
-
-                        _lastRefresh = DateTime.UtcNow;
-                        return;
-                    }
+                    await ProcessMasterQuoteResponse(content);
+                    return;
                 }
 
-                _logger.LogWarning("Failed to get master quote, using fallback");
+                _logger.LogWarning("Failed to get master quote. Status code: {StatusCode}", response.StatusCode);
                 LoadFallbackStocks();
             }
             catch (Exception ex)
@@ -270,12 +256,64 @@ namespace StockNotificationApi.Services
             }
         }
 
-        #region Helper Methods
+        #region Private Methods
+
+        private void ConfigureHttpClient(HttpClient client)
+        {
+            client.DefaultRequestHeaders.Clear();
+            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+            client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
+            client.DefaultRequestHeaders.Add("Referer", "https://www.nseindia.com");
+            client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
+        }
+
+        private async Task ProcessMasterQuoteResponse(string content)
+        {
+            try
+            {
+                var symbols = JsonSerializer.Deserialize<List<string>>(content);
+
+                if (symbols != null && symbols.Any())
+                {
+                    var newStockList = new List<StockInfo>();
+                    foreach (var symbol in symbols)
+                    {
+                        newStockList.Add(new StockInfo
+                        {
+                            Symbol = symbol,
+                            CompanyName = GetCompanyName(symbol),
+                            Exchange = "NSE",
+                            Sector = GetSector(symbol),
+                            Industry = GetIndustry(symbol),
+                            IsFNOSec = IsLikelyFNOSymbol(symbol)
+                        });
+                    }
+
+                    _cachedNSEStocks = newStockList;
+                    _cachedFNOSymbols = symbols.Take(FNO_LIST_SIZE).ToList();
+                    _lastRefresh = DateTime.UtcNow;
+
+                    _logger.LogInformation("Successfully loaded {Count} stocks from NSE master quote", _cachedNSEStocks.Count);
+                }
+                else
+                {
+                    _logger.LogWarning("No symbols found in master quote response");
+                    LoadFallbackStocks();
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogError(ex, "Failed to parse master quote response");
+                LoadFallbackStocks();
+            }
+        }
 
         private bool IsLikelyFNOSymbol(string symbol)
         {
-            // This is a simplified check - you can expand this list
-            var fnoCandidates = new HashSet<string>
+            if (string.IsNullOrEmpty(symbol)) return false;
+
+            var fnoCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
                 "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
                 "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
@@ -289,6 +327,8 @@ namespace StockNotificationApi.Services
 
         private string GetCompanyName(string symbol)
         {
+            if (string.IsNullOrEmpty(symbol)) return symbol;
+
             var names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["RELIANCE"] = "Reliance Industries Ltd",
@@ -313,11 +353,13 @@ namespace StockNotificationApi.Services
                 ["ULTRACEMCO"] = "UltraTech Cement Ltd"
             };
 
-            return names.ContainsKey(symbol) ? names[symbol] : symbol;
+            return names.TryGetValue(symbol, out var name) ? name : symbol;
         }
 
         private string GetSector(string symbol)
         {
+            if (string.IsNullOrEmpty(symbol)) return "Other";
+
             var sectors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["RELIANCE"] = "Energy",
@@ -342,11 +384,13 @@ namespace StockNotificationApi.Services
                 ["ULTRACEMCO"] = "Construction Materials"
             };
 
-            return sectors.ContainsKey(symbol) ? sectors[symbol] : "Other";
+            return sectors.TryGetValue(symbol, out var sector) ? sector : "Other";
         }
 
         private string GetIndustry(string symbol)
         {
+            if (string.IsNullOrEmpty(symbol)) return "General";
+
             var industries = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["RELIANCE"] = "Oil & Gas",
@@ -371,15 +415,12 @@ namespace StockNotificationApi.Services
                 ["ULTRACEMCO"] = "Cement"
             };
 
-            return industries.ContainsKey(symbol) ? industries[symbol] : "General";
+            return industries.TryGetValue(symbol, out var industry) ? industry : "General";
         }
 
         private void LoadFallbackStocks()
         {
             _logger.LogWarning("Loading fallback stock list");
-
-            _cachedNSEStocks = new List<StockInfo>();
-            _cachedFNOSymbols = new List<string>();
 
             var fallbackSymbols = new List<string>
             {
@@ -389,9 +430,12 @@ namespace StockNotificationApi.Services
                 "HCLTECH", "SUNPHARMA", "TITAN", "WIPRO", "ULTRACEMCO"
             };
 
+            var newStockList = new List<StockInfo>();
+            var newFnoList = new List<string>();
+
             foreach (var symbol in fallbackSymbols)
             {
-                _cachedNSEStocks.Add(new StockInfo
+                newStockList.Add(new StockInfo
                 {
                     Symbol = symbol,
                     CompanyName = GetCompanyName(symbol),
@@ -400,12 +444,14 @@ namespace StockNotificationApi.Services
                     IsFNOSec = true,
                     Exchange = "NSE"
                 });
-
-                _cachedFNOSymbols.Add(symbol);
+                newFnoList.Add(symbol);
             }
 
-            _logger.LogInformation("Loaded {Count} fallback stocks", _cachedNSEStocks.Count);
+            _cachedNSEStocks = newStockList;
+            _cachedFNOSymbols = newFnoList;
             _lastRefresh = DateTime.UtcNow;
+
+            _logger.LogInformation("Loaded {Count} fallback stocks", _cachedNSEStocks.Count);
         }
 
         #endregion

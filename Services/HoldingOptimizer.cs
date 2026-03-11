@@ -3,7 +3,6 @@ using StockNotificationApi.Models;
 
 namespace StockNotificationApi.Services
 {
-    // Services/HoldingOptimizer.cs
     public class HoldingOptimizer
     {
         private readonly IAngelOneService _angelOneService;
@@ -15,121 +14,189 @@ namespace StockNotificationApi.Services
             ITradingService tradingService,
             ILogger<HoldingOptimizer> logger)
         {
-            _angelOneService = angelOneService;
-            _tradingService = tradingService;
-            _logger = logger;
+            _angelOneService = angelOneService ?? throw new ArgumentNullException(nameof(angelOneService));
+            _tradingService = tradingService ?? throw new ArgumentNullException(nameof(tradingService));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         public async Task<OptimizationPlan> AnalyzeHoldingsAsync()
         {
-            var holdings = await _angelOneService.GetHoldingsAsync();
-            var todayTrades = await _tradingService.GetTodaysTradesAsync(60);
-
-            var plan = new OptimizationPlan();
-
-            foreach (var holding in holdings)
+            try
             {
-                var currentTrade = todayTrades.Trades.FirstOrDefault(t => t.Symbol == holding.Symbol);
+                _logger.LogInformation("Starting holdings analysis...");
 
-                if (currentTrade != null)
+                var holdings = await _angelOneService.GetHoldingsAsync();
+                if (holdings == null || !holdings.Any())
                 {
-                    // Stock is in today's picks
-                    var currentPrice = holding.CurrentPrice;
-                    var targetPrice = currentTrade.TargetPrice;
-                    var stopLoss = currentTrade.StopLoss;
-
-                    // Calculate optimal action
-                    var action = DetermineAction(holding, currentTrade);
-                    plan.Actions.Add(action);
+                    _logger.LogInformation("No holdings found");
+                    return new OptimizationPlan();
                 }
-                else
+
+                var todayTrades = await _tradingService.GetTodaysTradesAsync(60);
+                if (todayTrades?.Trades == null)
                 {
-                    // Stock not in today's picks - check if we should sell
-                    var sellSignal = await ShouldSell(holding);
-                    if (sellSignal.ShouldSell)
+                    _logger.LogInformation("No trades available for today");
+                    todayTrades = new TradingDashboard { Trades = new List<TradeItem>() };
+                }
+
+                var plan = new OptimizationPlan
+                {
+                    Actions = new List<TradeAction>()
+                };
+
+                foreach (var holding in holdings)
+                {
+                    if (holding == null) continue;
+
+                    var currentTrade = todayTrades.Trades.FirstOrDefault(t =>
+                        t != null && t.Symbol?.Equals(holding.Symbol, StringComparison.OrdinalIgnoreCase) == true);
+
+                    if (currentTrade != null)
                     {
-                        plan.Actions.Add(new TradeAction
+                        // Stock is in today's picks
+                        var action = DetermineAction(holding, currentTrade);
+                        if (action != null)
                         {
-                            Symbol = holding.Symbol,
-                            Action = "SELL",
-                            Quantity = holding.Quantity,
-                            Reason = sellSignal.Reason,
-                            Priority = sellSignal.Priority
-                        });
+                            plan.Actions.Add(action);
+                            _logger.LogDebug("Added action for {Symbol}: {Action}", holding.Symbol, action.Action);
+                        }
+                    }
+                    else
+                    {
+                        // Stock not in today's picks - check if we should sell
+                        var sellSignal = await ShouldSell(holding);
+                        if (sellSignal.ShouldSell)
+                        {
+                            plan.Actions.Add(new TradeAction
+                            {
+                                Symbol = holding.Symbol,
+                                Action = "SELL",
+                                Quantity = holding.Quantity,
+                                Price = holding.CurrentPrice,
+                                Reason = sellSignal.Reason,
+                                Priority = sellSignal.Priority,
+                                StopLoss = holding.CurrentPrice * 0.95m, // Default stop loss
+                                TargetPrice = holding.CurrentPrice * 1.05m, // Default target
+                                ExpectedProfit = CalculateExpectedProfit(holding, sellSignal)
+                            });
+                            _logger.LogDebug("Added sell signal for {Symbol}: {Reason}", holding.Symbol, sellSignal.Reason);
+                        }
                     }
                 }
-            }
 
-            return plan;
+                plan.TotalImpact = plan.Actions.Sum(a => a.ExpectedProfit);
+                _logger.LogInformation("Analysis complete. Found {Count} actions", plan.Actions.Count);
+
+                return plan;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error analyzing holdings");
+                return new OptimizationPlan();
+            }
         }
 
         private TradeAction DetermineAction(Holding holding, TradeItem trade)
         {
-            var currentPrice = holding.CurrentPrice;
-            var profitLoss = ((currentPrice - holding.AveragePrice) / holding.AveragePrice) * 100;
+            if (holding == null || trade == null)
+                return null;
 
+            var currentPrice = holding.CurrentPrice;
+            var averagePrice = holding.AveragePrice > 0 ? holding.AveragePrice : currentPrice;
+            var profitLoss = ((currentPrice - averagePrice) / averagePrice) * 100;
+
+            // Target reached - sell all
             if (currentPrice >= trade.TargetPrice)
             {
+                var expectedProfit = (currentPrice - averagePrice) * holding.Quantity;
                 return new TradeAction
                 {
                     Symbol = holding.Symbol,
                     Action = "SELL",
                     Quantity = holding.Quantity,
-                    Reason = $"Target reached (Current: ₹{currentPrice}, Target: ₹{trade.TargetPrice})",
-                    Priority = 1
+                    Price = currentPrice,
+                    Reason = $"Target reached (Current: ₹{currentPrice:F2}, Target: ₹{trade.TargetPrice:F2})",
+                    Priority = 1,
+                    StopLoss = trade.StopLoss,
+                    TargetPrice = trade.TargetPrice,
+                    ExpectedProfit = expectedProfit
                 };
             }
 
+            // Stop loss hit - sell all
             if (currentPrice <= trade.StopLoss)
             {
+                var expectedLoss = (averagePrice - currentPrice) * holding.Quantity;
                 return new TradeAction
                 {
                     Symbol = holding.Symbol,
                     Action = "SELL",
                     Quantity = holding.Quantity,
-                    Reason = $"Stop loss hit (Current: ₹{currentPrice}, SL: ₹{trade.StopLoss})",
-                    Priority = 1
+                    Price = currentPrice,
+                    Reason = $"Stop loss hit (Current: ₹{currentPrice:F2}, SL: ₹{trade.StopLoss:F2})",
+                    Priority = 1,
+                    StopLoss = trade.StopLoss,
+                    TargetPrice = trade.TargetPrice,
+                    ExpectedProfit = -expectedLoss // Negative for loss
                 };
             }
 
+            // Book partial profits if gain > 10%
             if (profitLoss > 10)
             {
+                var sellQuantity = (int)(holding.Quantity * 0.5m);
+                var expectedProfit = ((currentPrice - averagePrice) * sellQuantity);
+
                 return new TradeAction
                 {
                     Symbol = holding.Symbol,
                     Action = "SELL",
-                    Quantity = (int)(holding.Quantity * 0.5m), // Book partial profits
+                    Quantity = sellQuantity,
+                    Price = currentPrice,
                     Reason = $"Book partial profits at {profitLoss:F1}% gain",
-                    Priority = 2
+                    Priority = 2,
+                    StopLoss = trade.StopLoss,
+                    TargetPrice = trade.TargetPrice,
+                    ExpectedProfit = expectedProfit
                 };
             }
 
+            // Hold
             return new TradeAction
             {
                 Symbol = holding.Symbol,
                 Action = "HOLD",
                 Quantity = holding.Quantity,
-                Reason = $"Hold until target (₹{trade.TargetPrice}) or stop loss (₹{trade.StopLoss})",
-                Priority = 3
+                Price = currentPrice,
+                Reason = $"Hold until target (₹{trade.TargetPrice:F2}) or stop loss (₹{trade.StopLoss:F2})",
+                Priority = 3,
+                StopLoss = trade.StopLoss,
+                TargetPrice = trade.TargetPrice,
+                ExpectedProfit = 0
             };
         }
 
         private async Task<SellSignal> ShouldSell(Holding holding)
         {
-            var currentPrice = holding.CurrentPrice;
-            var profitLoss = ((currentPrice - holding.AveragePrice) / holding.AveragePrice) * 100;
+            if (holding == null)
+                return new SellSignal { ShouldSell = false };
 
-            // Check if stock is underperforming
+            var currentPrice = holding.CurrentPrice;
+            var averagePrice = holding.AveragePrice > 0 ? holding.AveragePrice : currentPrice;
+            var profitLoss = ((currentPrice - averagePrice) / averagePrice) * 100;
+
+            // Check if stock is underperforming (loss > 15%)
             if (profitLoss < -15)
             {
                 return new SellSignal
                 {
                     ShouldSell = true,
-                    Reason = $"Stop loss: -{Math.Abs(profitLoss):F1}% loss",
+                    Reason = $"Stop loss: {profitLoss:F1}% loss",
                     Priority = 1
                 };
             }
 
+            // Book profits if gain > 20%
             if (profitLoss > 20)
             {
                 return new SellSignal
@@ -142,5 +209,23 @@ namespace StockNotificationApi.Services
 
             return new SellSignal { ShouldSell = false };
         }
-    }    
+
+        private decimal CalculateExpectedProfit(Holding holding, SellSignal signal)
+        {
+            if (holding == null) return 0;
+
+            var averagePrice = holding.AveragePrice > 0 ? holding.AveragePrice : holding.CurrentPrice;
+
+            if (signal.Reason.Contains("loss"))
+            {
+                // Expected loss
+                return -((averagePrice - holding.CurrentPrice) * holding.Quantity);
+            }
+            else
+            {
+                // Expected profit
+                return ((holding.CurrentPrice - averagePrice) * holding.Quantity);
+            }
+        }
+    }
 }

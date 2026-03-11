@@ -4,6 +4,13 @@ using StockNotificationApi.Data;
 using System.Text;
 using System.Text.Json;
 using OtpNet;
+using System.Net.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace StockNotificationApi.Services
 {
@@ -16,27 +23,27 @@ namespace StockNotificationApi.Services
         private AngelOneSession _session;
         private readonly SemaphoreSlim _authLock = new SemaphoreSlim(1, 1);
         private string _accessToken;
+        private string _userId;
+        private string _feedToken;
 
         // Store these during authentication for consistency across requests
         private string _clientLocalIP;
         private string _clientPublicIP;
         private string _macAddress;
 
-        // Constants for API endpoints - Note: Using .in domain as it's more reliable
+        // Constants for API endpoints
         private const string BASE_URL = "https://apiconnect.angelone.in/";
         private const string AUTH_ENDPOINT = "rest/auth/angelbroking/user/v1/loginByPassword";
-        private const string HOLDINGS_ENDPOINT = "rest/secure/angelbroking/holding/v1/getHolding";
+
+        // Holdings endpoint - exactly as per Java example
+        private const string HOLDINGS_ENDPOINT = "rest/secure/angelbroking/portfolio/v1/getHolding";
+
+        // Other endpoints
         private const string ORDER_ENDPOINT = "rest/order/v1/placeOrder";
         private const string POSITIONS_ENDPOINT = "rest/secure/angelbroking/portfolio/v1/getAllPositions";
+        private const string POSITIONS_ENDPOINT_2 = "rest/portfolio/v1/positions";
+        private const string POSITIONS_ENDPOINT_3 = "rest/secure/portfolio/v1/positions";
         private const string CANCEL_ORDER_ENDPOINT = "rest/order/v1/cancelOrder";
-
-        // Update your constants to try different endpoints
-        private const string HOLDINGS_ENDPOINT_1 = "rest/secure/angelbroking/holding/v1/getHolding";
-        private const string HOLDINGS_ENDPOINT_2 = "rest/portfolio/v1/holdings";
-        private const string HOLDINGS_ENDPOINT_3 = "rest/secure/portfolio/v1/holdings";
-
-        // In your GetHoldingsAsync, try each one:
-        // var response = await client.PostAsync(HOLDINGS_ENDPOINT_1, content);
 
         public AngelOneService(
             IConfiguration configuration,
@@ -124,14 +131,18 @@ namespace StockNotificationApi.Services
                         };
 
                         _accessToken = result.data.jwtToken;
+                        _userId = result.data.userId;
+                        _feedToken = result.data.feedToken;
+
                         _logger.LogInformation("✅ Successfully authenticated with Angel One");
+                        _logger.LogInformation("User ID: {UserId}, Token expires at: {Expiry}", _userId, _session.ExpiresAt);
+
                         return _session;
                     }
                 }
                 else if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
                 {
                     _logger.LogError("❌ IP Address not whitelisted. Add this IP to Angel One portal: {Ip}", _clientPublicIP);
-                    _logger.LogError("Please contact Angel One support with your Public IP and Support ID if provided");
                 }
                 else
                 {
@@ -163,29 +174,38 @@ namespace StockNotificationApi.Services
             _httpClient.DefaultRequestHeaders.Add("X-MACAddress", _macAddress);
             _httpClient.DefaultRequestHeaders.Add("X-PrivateKey", apiKey);
             _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
-
-            // Don't add Content-Type here - it's set by StringContent
         }
 
         private void SetSessionHeaders(HttpClient client)
         {
             client.DefaultRequestHeaders.Clear();
+
+            // Add headers in the EXACT order as Java example
             client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_accessToken}");
-            client.DefaultRequestHeaders.Add("X-PrivateKey", _configuration["AngelOne:ApiKey"]);
+            client.DefaultRequestHeaders.Add("Content-Type", "application/json");
             client.DefaultRequestHeaders.Add("Accept", "application/json");
             client.DefaultRequestHeaders.Add("X-UserType", "USER");
             client.DefaultRequestHeaders.Add("X-SourceID", "WEB");
+            client.DefaultRequestHeaders.Add("X-ClientLocalIP", _clientLocalIP ?? "127.0.0.1");
+            client.DefaultRequestHeaders.Add("X-ClientPublicIP", _clientPublicIP ?? "127.0.0.1");
+            client.DefaultRequestHeaders.Add("X-MACAddress", _macAddress ?? "00-00-00-00-00-00");
+            client.DefaultRequestHeaders.Add("X-PrivateKey", _configuration["AngelOne:ApiKey"]);
 
-            // For localhost, use these specific values
-            client.DefaultRequestHeaders.Add("X-ClientLocalIP", "127.0.0.1");
-            client.DefaultRequestHeaders.Add("X-ClientPublicIP", "127.0.0.1");
-            client.DefaultRequestHeaders.Add("X-MACAddress", "00-00-00-00-00-00");
+            // Add feed token if available
+            if (!string.IsNullOrEmpty(_feedToken))
+            {
+                client.DefaultRequestHeaders.Add("X-FeedToken", _feedToken);
+            }
+
+            _logger.LogDebug("Session Headers set: {Headers}", string.Join(", ",
+                client.DefaultRequestHeaders.Select(h => $"{h.Key}: {string.Join(",", h.Value)}")));
         }
 
         private async Task EnsureAuthenticatedAsync()
         {
             if (_session == null || string.IsNullOrEmpty(_accessToken))
             {
+                _logger.LogInformation("No active session, authenticating...");
                 await AuthenticateAsync();
                 return;
             }
@@ -253,6 +273,214 @@ namespace StockNotificationApi.Services
             {
                 return "00-00-00-00-00-00";
             }
+        }
+
+        #endregion
+
+        #region Portfolio Operations
+
+        public async Task<List<Holding>> GetHoldingsAsync()
+        {
+            await EnsureAuthenticatedAsync();
+
+            if (string.IsNullOrEmpty(_accessToken))
+            {
+                _logger.LogError("AngelOne not authenticated");
+                return new List<Holding>();
+            }
+
+            try
+            {
+                _logger.LogInformation("Fetching holdings from Angel One...");
+
+                using var client = _httpClientFactory.CreateClient();
+                client.BaseAddress = new Uri(BASE_URL);
+                client.Timeout = TimeSpan.FromSeconds(30);
+
+                // Clear any default headers
+                client.DefaultRequestHeaders.Clear();
+
+                // Add ONLY request headers to DefaultRequestHeaders
+                client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_accessToken}");
+                client.DefaultRequestHeaders.Add("Accept", "application/json");
+                client.DefaultRequestHeaders.Add("X-UserType", "USER");
+                client.DefaultRequestHeaders.Add("X-SourceID", "WEB");
+                client.DefaultRequestHeaders.Add("X-ClientLocalIP", _clientLocalIP ?? "127.0.0.1");
+                client.DefaultRequestHeaders.Add("X-ClientPublicIP", _clientPublicIP ?? "127.0.0.1");
+                client.DefaultRequestHeaders.Add("X-MACAddress", _macAddress ?? "00-00-00-00-00-00");
+                client.DefaultRequestHeaders.Add("X-PrivateKey", _configuration["AngelOne:ApiKey"]);
+
+                // CRITICAL: Create GET request with null body
+                var request = new HttpRequestMessage(HttpMethod.Get, HOLDINGS_ENDPOINT)
+                {
+                    Content = null  // No content, exactly like Java's .method("GET", null)
+                };                
+
+                _logger.LogInformation("Making GET request to: {BaseUrl}{Endpoint}", BASE_URL, HOLDINGS_ENDPOINT);
+
+                // Log headers for debugging
+                _logger.LogDebug("Request Headers: {Headers}", string.Join(", ",
+                    client.DefaultRequestHeaders.Select(h => $"{h.Key}: {string.Join(",", h.Value)}")));
+
+                var response = await client.SendAsync(request);
+                var responseContent = await response.Content.ReadAsStringAsync();
+
+                _logger.LogInformation("Holdings Response Status: {StatusCode}", response.StatusCode);
+                _logger.LogInformation("Holdings Response Body: {Response}", responseContent);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var result = JsonSerializer.Deserialize<AngelOneHoldingsResponse>(
+                        responseContent,
+                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                    if (result?.status == true && result.data != null)
+                    {
+                        var holdings = result.data.Select(h => new Holding
+                        {
+                            Symbol = h.tradingsymbol,
+                            Quantity = h.quantity + (h.t1quantity),
+                            AveragePrice = h.averageprice,
+                            CurrentPrice = h.ltp,
+                            ProfitLoss = h.profitloss ?? h.profitandloss
+                        }).ToList();
+
+                        _logger.LogInformation("✅ Successfully fetched {Count} holdings", holdings.Count);
+                        return holdings;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Holdings response status false or no data: {Status}", result?.status);
+                    }
+                }
+                else if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                {
+                    _logger.LogWarning("Token expired, re-authenticating...");
+                    _session = null;
+                    _accessToken = null;
+                    return await GetHoldingsAsync();
+                }
+                else
+                {
+                    _logger.LogError("❌ Holdings request failed: {StatusCode}", response.StatusCode);
+                    _logger.LogError("Response: {Response}", responseContent);
+                }
+
+                return new List<Holding>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching holdings");
+                return new List<Holding>();
+            }
+        }
+
+        public async Task<List<Position>> GetPositionsAsync()
+        {
+            await EnsureAuthenticatedAsync();
+
+            try
+            {
+                _logger.LogInformation("Fetching positions from Angel One...");
+
+                using var client = _httpClientFactory.CreateClient();
+                client.BaseAddress = new Uri(BASE_URL);
+                client.Timeout = TimeSpan.FromSeconds(30);
+
+                SetSessionHeaders(client);
+
+                // Try different endpoints in order
+                var endpoints = new[]
+                {
+                    POSITIONS_ENDPOINT,
+                    POSITIONS_ENDPOINT_2,
+                    POSITIONS_ENDPOINT_3
+                };
+
+                foreach (var endpoint in endpoints)
+                {
+                    try
+                    {
+                        _logger.LogDebug("Trying endpoint: {Endpoint}", endpoint);
+
+                        HttpResponseMessage response;
+
+                        if (endpoint.Contains("getAllPositions"))
+                        {
+                            // Some endpoints use POST with empty body
+                            var requestBody = new
+                            {
+                                clientcode = _userId ?? _configuration["AngelOne:ClientId"]
+                            };
+                            var content = new StringContent(
+                                JsonSerializer.Serialize(requestBody),
+                                Encoding.UTF8,
+                                "application/json"
+                            );
+                            response = await client.PostAsync(endpoint, content);
+                        }
+                        else
+                        {
+                            response = await client.GetAsync(endpoint);
+                        }
+
+                        var responseContent = await response.Content.ReadAsStringAsync();
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            var result = JsonSerializer.Deserialize<AngelOnePositionsResponse>(
+                                responseContent,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                            if (result?.status == true && result.data != null)
+                            {
+                                var positions = result.data.Select(p => new Position
+                                {
+                                    Symbol = p.tradingsymbol,
+                                    Quantity = p.quantity,
+                                    BuyPrice = p.buyprice,
+                                    CurrentPrice = p.ltp
+                                }).ToList();
+
+                                _logger.LogInformation("✅ Successfully fetched {Count} positions from {Endpoint}",
+                                    positions.Count, endpoint);
+                                return positions;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error with endpoint {Endpoint}, trying next...", endpoint);
+                    }
+                }
+
+                _logger.LogError("All endpoints failed for fetching positions");
+                return new List<Position>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching positions");
+                return new List<Position>();
+            }
+        }
+
+        public async Task<PortfolioSummary> GetPortfolioAsync()
+        {
+            var holdings = await GetHoldingsAsync();
+
+            var summary = new PortfolioSummary
+            {
+                TotalInvestment = holdings.Sum(h => h.Quantity * h.AveragePrice),
+                CurrentValue = holdings.Sum(h => h.Quantity * h.CurrentPrice),
+                Holdings = holdings,
+                AsOfDate = DateTime.Now
+            };
+
+            _logger.LogInformation("Portfolio Summary - Value: ₹{CurrentValue:N2}, Investment: ₹{TotalInvestment:N2}, P&L: ₹{Pnl:N2} ({Percent:F2}%)",
+                summary.CurrentValue, summary.TotalInvestment, summary.TotalProfitLoss,
+                summary.TotalInvestment > 0 ? (summary.TotalProfitLoss / summary.TotalInvestment) * 100 : 0);
+
+            return summary;
         }
 
         #endregion
@@ -444,188 +672,6 @@ namespace StockNotificationApi.Services
                     ExecutionTime = DateTime.Now
                 };
             }
-        }
-
-        #endregion
-
-        #region Portfolio Operations
-        public async Task<List<Holding>> GetHoldingsAsync()
-        {
-            await EnsureAuthenticatedAsync();
-
-            if (string.IsNullOrEmpty(_accessToken))
-            {
-                _logger.LogError("AngelOne not authenticated");
-                return new List<Holding>();
-            }
-
-            try
-            {
-                _logger.LogInformation("Fetching holdings from Angel One...");
-
-                using var client = _httpClientFactory.CreateClient();
-                client.BaseAddress = new Uri(BASE_URL);
-                client.Timeout = TimeSpan.FromSeconds(30);
-
-                // Clear any default headers
-                client.DefaultRequestHeaders.Clear();
-
-                // Add ONLY request headers to DefaultRequestHeaders
-                client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_accessToken}");
-                client.DefaultRequestHeaders.Add("Accept", "application/json");
-                client.DefaultRequestHeaders.Add("X-UserType", "USER");
-                client.DefaultRequestHeaders.Add("X-SourceID", "WEB");
-                client.DefaultRequestHeaders.Add("X-ClientLocalIP", _clientLocalIP ?? "127.0.0.1");
-                client.DefaultRequestHeaders.Add("X-ClientPublicIP", _clientPublicIP ?? "127.0.0.1");
-                client.DefaultRequestHeaders.Add("X-MACAddress", _macAddress ?? "00-00-00-00-00-00");
-                client.DefaultRequestHeaders.Add("X-PrivateKey", _configuration["AngelOne:ApiKey"]);
-
-                // CRITICAL: Create GET request with null body
-                var request = new HttpRequestMessage(HttpMethod.Get, HOLDINGS_ENDPOINT)
-                {
-                    Content = null  // No content, exactly like Java's .method("GET", null)
-                };
-
-                // If you need to add Content-Type (even with null body), you'd need to create empty content
-                // But since the Java example doesn't send a body, we don't need Content-Type
-                // If you want to be explicit, use this instead:
-                /*
-                var request = new HttpRequestMessage(HttpMethod.Get, HOLDINGS_ENDPOINT)
-                {
-                    Content = new StringContent("", Encoding.UTF8, "application/json")
-                };
-                */
-
-                _logger.LogInformation("Making GET request to: {BaseUrl}{Endpoint}", BASE_URL, HOLDINGS_ENDPOINT);
-
-                // Log headers for debugging
-                _logger.LogDebug("Request Headers: {Headers}", string.Join(", ",
-                    client.DefaultRequestHeaders.Select(h => $"{h.Key}: {string.Join(",", h.Value)}")));
-
-                var response = await client.SendAsync(request);
-                var responseContent = await response.Content.ReadAsStringAsync();
-
-                _logger.LogInformation("Holdings Response Status: {StatusCode}", response.StatusCode);
-                _logger.LogInformation("Holdings Response Body: {Response}", responseContent);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var result = JsonSerializer.Deserialize<AngelOneHoldingsResponse>(
-                        responseContent,
-                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-                    if (result?.status == true && result.data != null)
-                    {
-                        var holdings = result.data.Select(h => new Holding
-                        {
-                            Symbol = h.tradingsymbol,
-                            Quantity = h.quantity + (h.t1quantity),
-                            AveragePrice = h.averageprice,
-                            CurrentPrice = h.ltp,
-                            ProfitLoss = h.profitloss
-                        }).ToList();
-
-                        _logger.LogInformation("✅ Successfully fetched {Count} holdings", holdings.Count);
-                        return holdings;
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Holdings response status false or no data: {Status}", result?.status);
-                    }
-                }
-                else if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-                {
-                    _logger.LogWarning("Token expired, re-authenticating...");
-                    _session = null;
-                    _accessToken = null;
-                    return await GetHoldingsAsync();
-                }
-                else
-                {
-                    _logger.LogError("❌ Holdings request failed: {StatusCode}", response.StatusCode);
-                    _logger.LogError("Response: {Response}", responseContent);
-                }
-
-                return new List<Holding>();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching holdings");
-                return new List<Holding>();
-            }
-        }
-        public async Task<List<Position>> GetPositionsAsync()
-        {
-            await EnsureAuthenticatedAsync();
-
-            try
-            {
-                _logger.LogInformation("Fetching positions...");
-
-                using var client = _httpClientFactory.CreateClient();
-                client.BaseAddress = new Uri(BASE_URL);
-                client.Timeout = TimeSpan.FromSeconds(30);
-
-                SetSessionHeaders(client);
-
-                var requestBody = new { };
-                var content = new StringContent(
-                    JsonSerializer.Serialize(requestBody),
-                    Encoding.UTF8,
-                    "application/json"
-                );
-
-                var response = await client.PostAsync(POSITIONS_ENDPOINT, content);
-                var responseContent = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
-                {
-                    _logger.LogInformation("Positions fetched successfully");
-                    _logger.LogDebug("Positions Response: {Response}", responseContent);
-
-                    // TODO: Deserialize positions response when you have the model
-                    return new List<Position>();
-                }
-                else
-                {
-                    if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
-                    {
-                        _logger.LogError("❌ Access Forbidden. Your IP {PublicIP} needs to be whitelisted",
-                            _clientPublicIP);
-                    }
-                    else
-                    {
-                        _logger.LogError("Failed to fetch positions: {StatusCode} - {Response}",
-                            response.StatusCode, responseContent);
-                    }
-                }
-
-                return new List<Position>();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching positions");
-                return new List<Position>();
-            }
-        }
-
-        public async Task<PortfolioSummary> GetPortfolioAsync()
-        {
-
-            var holdings = await GetHoldingsAsync();
-
-            var summary = new PortfolioSummary
-            {
-                TotalInvestment = holdings.Sum(h => h.Quantity * h.AveragePrice),
-                CurrentValue = holdings.Sum(h => h.Quantity * h.CurrentPrice),
-                Holdings = holdings,
-                AsOfDate = DateTime.Now
-            };
-
-            _logger.LogInformation("Portfolio Summary - Value: ₹{CurrentValue:N2}, Investment: ₹{TotalInvestment:N2}, P&L: ₹{Pnl:N2}",
-                summary.CurrentValue, summary.TotalInvestment, summary.TotalProfitLoss);
-
-            return summary;
         }
 
         #endregion

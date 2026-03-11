@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
+using StockNotificationApi.Services; // Add this for PriceAlertService
 using System.Text;
 using System.Text.Json;
 using Telegram.Bot;
@@ -14,6 +15,7 @@ namespace StockNotificationApi.Services
         private readonly ILogger<TelegramBotService> _logger;
         private readonly IConfiguration _configuration;
         private readonly IServiceScopeFactory _scopeFactory;
+        private readonly IPriceAlertService _priceAlertService; // Add this
         private TelegramBotClient? _botClient;
         private readonly List<long> _subscribedChats = new();
         private readonly List<long> _briefingSubscribers = new();
@@ -38,6 +40,7 @@ namespace StockNotificationApi.Services
         private const int REPORT_HOUR = 9;
         private const int REPORT_MINUTE = 0;
         private const int PRICE_COMMAND_PREFIX_LENGTH = 6;
+        private const int ALERT_COMMAND_PREFIX_LENGTH = 6; // Add this
         private const int MAX_RETRY_ATTEMPTS = 3;
         private const int RETRY_DELAY_MS = 1000;
 
@@ -46,14 +49,17 @@ namespace StockNotificationApi.Services
         private const int MAX_COMMANDS_PER_MINUTE = 20;
         private const int RATE_LIMIT_WINDOW_MINUTES = 1;
 
+        // Update constructor
         public TelegramBotService(
             ILogger<TelegramBotService> logger,
             IConfiguration configuration,
-            IServiceScopeFactory scopeFactory)
+            IServiceScopeFactory scopeFactory,
+            IPriceAlertService priceAlertService) // Add this parameter
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
             _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
+            _priceAlertService = priceAlertService ?? throw new ArgumentNullException(nameof(priceAlertService));
         }
 
         public async Task SendMessageAsync(long chatId, string message, ParseMode parseMode = ParseMode.Html)
@@ -260,8 +266,24 @@ namespace StockNotificationApi.Services
                             case "/optimize_holdings":
                                 await OptimizeHoldings(chatId);
                                 break;
+                            case "/alerts":
+                                await ShowAlerts(chatId);
+                                break;
+                            case "/clearalerts":
+                                await ClearAlerts(chatId);
+                                break;
+                            case "/market":
+                                await SendMarketStatus(chatId);
+                                break;
                             default:
-                                await HandlePriceCommand(chatId, text, lowerText);
+                                if (lowerText.StartsWith("/alert"))
+                                    await HandleAlertCommand(chatId, text);
+                                else if (lowerText.StartsWith("/price"))
+                                    await HandlePriceCommand(chatId, text);
+                                else if (lowerText.StartsWith("/removealert"))
+                                    await HandleRemoveAlertCommand(chatId, text);
+                                else
+                                    await SendMessageAsync(chatId, "❌ Unknown command. Type /help for available commands.");
                                 break;
                         }
                     }
@@ -322,6 +344,20 @@ namespace StockNotificationApi.Services
                     await SendMessageAsync(chatId, "🔄 Fetching your portfolio status... Please wait.");
                 else if (lowerText == "/optimize_holdings")
                     await SendMessageAsync(chatId, "🔄 Optimizing your holdings... Please wait.");
+                else if (lowerText == "/alerts")
+                    await SendMessageAsync(chatId, "🔄 Fetching your alerts... Please wait.");
+                else if (lowerText == "/clearalerts")
+                    await SendMessageAsync(chatId, "🔄 Clearing triggered alerts...");
+                else if (lowerText.StartsWith("/alert"))
+                {
+                    var symbol = originalText.Length > ALERT_COMMAND_PREFIX_LENGTH
+                        ? originalText.Substring(ALERT_COMMAND_PREFIX_LENGTH).Split(' ').FirstOrDefault()?.Trim()
+                        : null;
+                    if (!string.IsNullOrEmpty(symbol))
+                        await SendMessageAsync(chatId, $"🔄 Setting price alert for {symbol}... Please wait.");
+                    else
+                        await SendTypingAction(chatId);
+                }
                 else if (lowerText.StartsWith("/price"))
                 {
                     var symbol = originalText.Substring(PRICE_COMMAND_PREFIX_LENGTH).Trim();
@@ -339,29 +375,189 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task HandlePriceCommand(long chatId, string text, string lowerText)
+        // Add this new method for alert command
+        private async Task HandleAlertCommand(long chatId, string text)
         {
-            if (lowerText.StartsWith("/price"))
+            // Format: /alert RELIANCE 2500 above
+            // or: /alert RELIANCE 2500 below
+            var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length < 3)
             {
-                if (text.Length <= PRICE_COMMAND_PREFIX_LENGTH)
+                await SendMessageAsync(chatId,
+                    "❌ Invalid format. Use:\n" +
+                    "/alert SYMBOL PRICE [above/below]\n" +
+                    "Example: /alert RELIANCE 2500 above");
+                return;
+            }
+
+            var symbol = parts[1].ToUpper();
+
+            if (!decimal.TryParse(parts[2], out decimal targetPrice))
+            {
+                await SendMessageAsync(chatId, "❌ Invalid price. Please enter a valid number.");
+                return;
+            }
+
+            bool isAbove = parts.Length < 4 || parts[3].ToLower() != "below";
+
+            try
+            {
+                await _priceAlertService.AddAlertAsync(chatId, symbol, targetPrice, isAbove);
+
+                var direction = isAbove ? "above" : "below";
+                await SendMessageAsync(chatId,
+                    $"✅ Alert set for {symbol} at ₹{targetPrice:N2} {direction}\n\n" +
+                    $"You'll be notified when price goes {direction} this level.");
+            }
+            catch (ArgumentException ex)
+            {
+                await SendMessageAsync(chatId, $"❌ {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error setting alert for {ChatId}", chatId);
+                await SendMessageAsync(chatId, "❌ Error setting alert. Please try again.");
+            }
+        }
+
+        // Add this new method for removing alerts
+        private async Task HandleRemoveAlertCommand(long chatId, string text)
+        {
+            // Format: /removealert 123
+            var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length < 2)
+            {
+                await SendMessageAsync(chatId, "❌ Please provide alert ID. Example: /removealert 123");
+                return;
+            }
+
+            if (!int.TryParse(parts[1], out int alertId))
+            {
+                await SendMessageAsync(chatId, "❌ Invalid alert ID.");
+                return;
+            }
+
+            try
+            {
+                var removed = await _priceAlertService.RemoveAlertAsync(chatId, alertId);
+                if (removed)
                 {
-                    await SendMessageAsync(chatId, "❌ Please provide a symbol. Example: /price RELIANCE");
+                    await SendMessageAsync(chatId, $"✅ Alert #{alertId} removed successfully.");
+                }
+                else
+                {
+                    await SendMessageAsync(chatId, $"❌ Alert #{alertId} not found.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error removing alert for {ChatId}", chatId);
+                await SendMessageAsync(chatId, "❌ Error removing alert. Please try again.");
+            }
+        }
+
+        // Add this new method to show alerts
+        private async Task ShowAlerts(long chatId)
+        {
+            try
+            {
+                var alerts = await _priceAlertService.GetUserAlertsAsync(chatId);
+
+                if (!alerts.Any())
+                {
+                    await SendMessageAsync(chatId,
+                        "📋 You have no alerts.\n\n" +
+                        "Set one with: /alert SYMBOL PRICE above/below");
                     return;
                 }
 
-                var symbol = text.Substring(PRICE_COMMAND_PREFIX_LENGTH).Trim();
-                if (string.IsNullOrWhiteSpace(symbol))
+                var activeAlerts = alerts.Where(a => !a.IsTriggered).ToList();
+                var triggeredAlerts = alerts.Where(a => a.IsTriggered).ToList();
+
+                var sb = new StringBuilder();
+                sb.AppendLine("<b>📋 Your Price Alerts</b>\n");
+
+                if (activeAlerts.Any())
                 {
-                    await SendMessageAsync(chatId, "❌ Please provide a symbol. Example: /price RELIANCE");
-                    return;
+                    sb.AppendLine("<b>🟢 Active Alerts:</b>");
+                    foreach (var alert in activeAlerts.OrderBy(a => a.Symbol))
+                    {
+                        var direction = alert.IsAbove ? "⬆️ above" : "⬇️ below";
+                        sb.AppendLine($"🆔 {alert.Id}: {alert.Symbol} {direction} ₹{alert.TargetPrice:N2}");
+                        sb.AppendLine($"   Set: {alert.CreatedAt:dd MMM HH:mm}");
+                    }
+                    sb.AppendLine();
                 }
 
-                await SendStockPrice(chatId, symbol.ToUpper());
+                if (triggeredAlerts.Any())
+                {
+                    sb.AppendLine("<b>✅ Triggered Alerts:</b>");
+                    foreach (var alert in triggeredAlerts.OrderByDescending(a => a.TriggeredAt).Take(5))
+                    {
+                        var direction = alert.IsAbove ? "above" : "below";
+                        sb.AppendLine($"   {alert.Symbol} moved {direction} ₹{alert.TargetPrice:N2}");
+                        sb.AppendLine($"   Triggered at ₹{alert.TriggeredPrice:N2} on {alert.TriggeredAt:dd MMM HH:mm}");
+                    }
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("<b>Commands:</b>");
+                sb.AppendLine("/alert SYMBOL PRICE above - Set alert");
+                sb.AppendLine("/alerts - Show all alerts");
+                sb.AppendLine("/clearalerts - Clear triggered alerts");
+                sb.AppendLine("/removealert ID - Remove specific alert");
+
+                await SendMessageAsync(chatId, sb.ToString());
             }
-            else
+            catch (Exception ex)
             {
-                await SendMessageAsync(chatId, "❌ Unknown command. Type /help for available commands.");
+                _logger.LogError(ex, "Error showing alerts for {ChatId}", chatId);
+                await SendMessageAsync(chatId, "❌ Error fetching alerts.");
             }
+        }
+
+        // Add this new method to clear alerts
+        private async Task ClearAlerts(long chatId)
+        {
+            try
+            {
+                await _priceAlertService.ClearTriggeredAlertsAsync(chatId);
+                await SendMessageAsync(chatId, "✅ All triggered alerts cleared.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error clearing alerts for {ChatId}", chatId);
+                await SendMessageAsync(chatId, "❌ Error clearing alerts.");
+            }
+        }
+
+        private async Task SendMarketStatus(long chatId)
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var marketStatus = scope.ServiceProvider.GetRequiredService<IMarketStatusService>();
+
+            var message = marketStatus.GetMarketStatusMessage();
+            await SendMessageAsync(chatId, message);
+        }
+
+        private async Task HandlePriceCommand(long chatId, string text)
+        {
+            if (text.Length <= PRICE_COMMAND_PREFIX_LENGTH)
+            {
+                await SendMessageAsync(chatId, "❌ Please provide a symbol. Example: /price RELIANCE");
+                return;
+            }
+
+            var symbol = text.Substring(PRICE_COMMAND_PREFIX_LENGTH).Trim();
+            if (string.IsNullOrWhiteSpace(symbol))
+            {
+                await SendMessageAsync(chatId, "❌ Please provide a symbol. Example: /price RELIANCE");
+                return;
+            }
+
+            await SendStockPrice(chatId, symbol.ToUpper());
         }
 
         private Task HandleErrorAsync(ITelegramBotClient client, Exception exception, CancellationToken token)
@@ -666,6 +862,7 @@ Hello {chat.FirstName}! I can help you with:
 • 📊 Daily market predictions
 • 🏆 Top gainers & losers
 • 📉 Market trends
+• 🔔 Price alerts
 
 <b>Commands:</b>
 /help - Show all commands
@@ -673,9 +870,10 @@ Hello {chat.FirstName}! I can help you with:
 /topgainers - Today's top gainers
 /toplosers - Today's top losers
 /price RELIANCE - Get stock price
+/alert RELIANCE 2500 above - Set price alert
+/alerts - View your alerts
 /subscribe - Get daily updates
 /portfolio_status - View your portfolio
-/optimize_holdings - Optimize your holdings
 
 <b>Get started by trying /stocks or /topgainers!</b>";
 
@@ -691,6 +889,14 @@ Hello {chat.FirstName}! I can help you with:
 /topgainers - View top 5 gainers today
 /toplosers - View top 5 losers today
 /price SYMBOL - Get price (e.g., /price RELIANCE)
+/market - Check if market is open
+
+
+<b>🔔 Price Alerts:</b>
+/alert SYMBOL PRICE above/below - Set price alert
+/alerts - View all your alerts
+/clearalerts - Clear triggered alerts
+/removealert ID - Remove specific alert
 
 <b>📊 Daily Briefing:</b>
 /briefing - Get today's AI-powered briefing

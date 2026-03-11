@@ -3,34 +3,28 @@ using StockNotificationApi.Models;
 
 namespace StockNotificationApi.Services
 {
-    // Services/AutoTradingService.cs
     public class AutoTradingService : BackgroundService
     {
-        private readonly ITradingService _tradingService;
-        private readonly IPortfolioService _portfolioService;
-        private readonly IAngelOneService _angelOneService;
-        private readonly IGrowwService _growwService;
+        private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<AutoTradingService> _logger;
         private readonly IConfiguration _configuration;
 
         // Risk management constants
-        private const decimal MAX_POSITION_SIZE_PERCENT = 0.05m; // 5% max per position
-        private const decimal MAX_DAILY_LOSS_PERCENT = 0.02m; // 2% max daily loss
-        private const decimal MAX_PORTFOLIO_RISK = 0.10m; // 10% max portfolio risk
+        private const decimal MAX_POSITION_SIZE_PERCENT = 0.05m;
+        private const decimal MAX_DAILY_LOSS_PERCENT = 0.02m;
+        private const decimal MAX_PORTFOLIO_RISK = 0.10m;
         private const int MAX_TRADES_PER_DAY = 5;
 
+        // In-memory trade tracking
+        private static readonly List<TradeExecution> _todayTrades = new();
+        private static readonly object _tradeLock = new();
+
         public AutoTradingService(
-            ITradingService tradingService,
-            IPortfolioService portfolioService,
-            IAngelOneService angelOneService,
-            IGrowwService growwService,
+            IServiceProvider serviceProvider,
             ILogger<AutoTradingService> logger,
             IConfiguration configuration)
         {
-            _tradingService = tradingService ?? throw new ArgumentNullException(nameof(tradingService));
-            _portfolioService = portfolioService ?? throw new ArgumentNullException(nameof(portfolioService));
-            _angelOneService = angelOneService ?? throw new ArgumentNullException(nameof(angelOneService));
-            _growwService = growwService ?? throw new ArgumentNullException(nameof(growwService));
+            _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         }
@@ -38,6 +32,14 @@ namespace StockNotificationApi.Services
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("Auto-Trading Service Started");
+
+            // Check if auto-trading is enabled in configuration
+            var autoTradingEnabled = _configuration.GetValue<bool>("Trading:AutoTradingEnabled", false);
+            if (!autoTradingEnabled)
+            {
+                _logger.LogInformation("Auto-trading is disabled. Set Trading:AutoTradingEnabled=true to enable.");
+                return;
+            }
 
             // Wait for market open (9:15 AM)
             await WaitForMarketOpen(stoppingToken);
@@ -53,33 +55,52 @@ namespace StockNotificationApi.Services
                         continue;
                     }
 
-                    // Get today's trading signals
-                    var dashboard = await _tradingService.GetTodaysTradesAsync(minConfidence: 70);
-
-                    if (dashboard?.Trades == null || !dashboard.Trades.Any())
+                    // Create a scope for scoped services
+                    using (var scope = _serviceProvider.CreateScope())
                     {
-                        _logger.LogInformation("No trading signals available today");
-                        await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
-                        continue;
-                    }
+                        var tradingService = scope.ServiceProvider.GetRequiredService<ITradingService>();
+                        var portfolioService = scope.ServiceProvider.GetRequiredService<IPortfolioService>();
+                        var angelOneService = scope.ServiceProvider.GetRequiredService<IAngelOneService>();
+                        var growwService = scope.ServiceProvider.GetService<IGrowwService>();
 
-                    // Get current portfolio
-                    var portfolio = await GetCombinedPortfolioValue();
+                        // Get today's trading signals
+                        var dashboard = await tradingService.GetTodaysTradesAsync(minConfidence: 70);
 
-                    // Check daily loss limit
-                    if (await HasExceededDailyLoss(portfolio))
-                    {
-                        _logger.LogWarning("Daily loss limit exceeded. Stopping trading for today.");
-                        await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
-                        continue;
-                    }
-
-                    // Process each trading signal
-                    foreach (var trade in dashboard.Trades.OrderByDescending(t => t.RiskReward))
-                    {
-                        if (await ShouldTrade(trade, portfolio))
+                        if (dashboard?.Trades == null || !dashboard.Trades.Any())
                         {
-                            await ExecuteTrade(trade, portfolio);
+                            _logger.LogInformation("No trading signals available today");
+                            await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
+                            continue;
+                        }
+
+                        // Get current portfolio
+                        var portfolio = await GetCombinedPortfolioValue(angelOneService);
+
+                        // Check daily loss limit
+                        if (await HasExceededDailyLoss(portfolio))
+                        {
+                            _logger.LogWarning("Daily loss limit exceeded. Stopping trading for today.");
+                            await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
+                            continue;
+                        }
+
+                        // Check trade count limit
+                        var todayTradeCount = GetTodayTradeCount();
+                        if (todayTradeCount >= MAX_TRADES_PER_DAY)
+                        {
+                            _logger.LogInformation("Maximum trades per day ({Max}) reached. Stopping trading for today.", MAX_TRADES_PER_DAY);
+                            await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
+                            continue;
+                        }
+
+                        // Process each trading signal (limit to remaining trades)
+                        var remainingTrades = MAX_TRADES_PER_DAY - todayTradeCount;
+                        foreach (var trade in dashboard.Trades.OrderByDescending(t => t.RiskReward).Take(remainingTrades))
+                        {
+                            if (await ShouldTrade(trade, portfolio, angelOneService))
+                            {
+                                await ExecuteTrade(trade, portfolio, angelOneService);
+                            }
                         }
                     }
 
@@ -94,12 +115,20 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task<bool> ShouldTrade(TradeItem trade, PortfolioSummary portfolio)
+        private int GetTodayTradeCount()
+        {
+            lock (_tradeLock)
+            {
+                return _todayTrades.Count(t => t.ExecutedAt.Date == DateTime.UtcNow.Date);
+            }
+        }
+
+        private async Task<bool> ShouldTrade(TradeItem trade, PortfolioSummary portfolio, IAngelOneService angelOneService)
         {
             try
             {
                 // Check if we already have this position
-                if (await HasPosition(trade.Symbol))
+                if (await HasPosition(trade.Symbol, angelOneService))
                 {
                     _logger.LogInformation("Already have position in {Symbol}, skipping", trade.Symbol);
                     return false;
@@ -145,7 +174,7 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task ExecuteTrade(TradeItem trade, PortfolioSummary portfolio)
+        private async Task ExecuteTrade(TradeItem trade, PortfolioSummary portfolio, IAngelOneService angelOneService)
         {
             try
             {
@@ -181,7 +210,7 @@ namespace StockNotificationApi.Services
                     Duration = "DAY"
                 };
 
-                var result = await _angelOneService.PlaceOrderAsync(order);
+                var result = await angelOneService.PlaceOrderAsync(order);
 
                 if (result.Status == "SUCCESS" || result.Status == "PLACED")
                 {
@@ -189,7 +218,7 @@ namespace StockNotificationApi.Services
                     await RecordTrade(trade, quantity, result.OrderId);
 
                     // Set stop loss
-                    await PlaceStopLoss(trade.Symbol, quantity, trade.StopLoss, result.OrderId);
+                    await PlaceStopLoss(trade.Symbol, quantity, trade.StopLoss, result.OrderId, angelOneService);
 
                     _logger.LogInformation("Trade executed successfully: Order {OrderId} for {Symbol}",
                         result.OrderId, trade.Symbol);
@@ -208,8 +237,6 @@ namespace StockNotificationApi.Services
 
         private decimal CalculateKellyFraction(decimal winProb, decimal riskReward)
         {
-            // Kelly Criterion: f = (p(b+1) - 1) / b
-            // where p = win probability, b = risk/reward ratio
             if (riskReward <= 0) return 0;
 
             var kelly = (winProb * (riskReward + 1) - 1) / riskReward;
@@ -218,17 +245,19 @@ namespace StockNotificationApi.Services
             return Math.Max(0, Math.Min(kelly * 0.5m, MAX_POSITION_SIZE_PERCENT));
         }
 
-        private async Task PlaceStopLoss(string symbol, int quantity, decimal stopLoss, string parentOrderId)
+        private async Task PlaceStopLoss(string symbol, int quantity, decimal stopLoss, string parentOrderId, IAngelOneService angelOneService)
         {
             try
             {
                 _logger.LogInformation("Setting stop loss for {Symbol}: {Quantity} shares @ ₹{StopLoss:F2}",
                     symbol, quantity, stopLoss);
 
-                // In production, you'd place a proper stop-loss order
-                // This could be a GTT (Good Till Triggered) order or bracket order
+                if (stopLoss <= 0)
+                {
+                    _logger.LogWarning("Invalid stop loss price for {Symbol}: {StopLoss}", symbol, stopLoss);
+                    return;
+                }
 
-                // Example of placing a stop-loss order
                 var stopLossOrder = new OrderRequest
                 {
                     Symbol = symbol,
@@ -243,10 +272,14 @@ namespace StockNotificationApi.Services
                 };
 
                 // Uncomment when ready to place actual stop-loss orders
-                // var result = await _angelOneService.PlaceOrderAsync(stopLossOrder);
+                // var result = await angelOneService.PlaceOrderAsync(stopLossOrder);
+                // if (result.Status == "SUCCESS")
+                // {
+                //     _logger.LogInformation("Stop loss placed successfully for {Symbol}", symbol);
+                // }
 
-                _logger.LogInformation("Stop loss placement simulated for {Symbol} at ₹{StopLoss:F2}",
-                    symbol, stopLoss);
+                _logger.LogInformation("Stop loss placement simulated for {Symbol} at ₹{StopLoss:F2} (Parent Order: {ParentOrderId})",
+                    symbol, stopLoss, parentOrderId);
             }
             catch (Exception ex)
             {
@@ -254,11 +287,11 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task<PortfolioSummary> GetCombinedPortfolioValue()
+        private async Task<PortfolioSummary> GetCombinedPortfolioValue(IAngelOneService angelOneService)
         {
             try
             {
-                var holdings = await _angelOneService.GetHoldingsAsync();
+                var holdings = await angelOneService.GetHoldingsAsync();
 
                 if (holdings == null || !holdings.Any())
                 {
@@ -272,8 +305,6 @@ namespace StockNotificationApi.Services
 
                 var currentValue = holdings.Sum(h => h.Quantity * h.CurrentPrice);
                 var totalInvestment = holdings.Sum(h => h.Quantity * h.AveragePrice);
-
-                // Don't assign TotalProfitLoss - it's calculated automatically
 
                 _logger.LogInformation("Portfolio Value: ₹{CurrentValue:N2}, Investment: ₹{TotalInvestment:N2}, P&L: ₹{ProfitLoss:N2} ({Percent:F1}%)",
                     currentValue, totalInvestment, currentValue - totalInvestment,
@@ -299,11 +330,11 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task<bool> HasPosition(string symbol)
+        private async Task<bool> HasPosition(string symbol, IAngelOneService angelOneService)
         {
             try
             {
-                var holdings = await _angelOneService.GetHoldingsAsync();
+                var holdings = await angelOneService.GetHoldingsAsync();
                 return holdings.Any(h => string.Equals(h.Symbol, symbol, StringComparison.OrdinalIgnoreCase));
             }
             catch (Exception ex)
@@ -317,7 +348,6 @@ namespace StockNotificationApi.Services
         {
             try
             {
-                // Track daily P&L
                 var dailyPL = await GetDailyProfitLoss();
                 var dailyLossLimit = portfolio.CurrentValue * MAX_DAILY_LOSS_PERCENT;
 
@@ -339,25 +369,56 @@ namespace StockNotificationApi.Services
 
         private async Task<decimal> GetDailyProfitLoss()
         {
-            // In production, track this in database
-            // For now, return 0 as placeholder
-            return await Task.FromResult(0m);
+            lock (_tradeLock)
+            {
+                var today = DateTime.UtcNow.Date;
+                return _todayTrades
+                    .Where(t => t.ExecutedAt.Date == today)
+                    .Sum(t => t.ProfitLoss);
+            }
         }
 
         private async Task RecordTrade(TradeItem trade, int quantity, string orderId)
         {
-            try
+            lock (_tradeLock)
             {
-                // In production, save to database
+                _todayTrades.Add(new TradeExecution
+                {
+                    Symbol = trade.Symbol,
+                    Action = "BUY",
+                    Quantity = quantity,
+                    Price = trade.CurrentPrice,
+                    Time = DateTime.Now,
+                    OrderId = orderId,
+                    ProfitLoss = 0
+                });
+
                 _logger.LogInformation("Trade recorded: {Symbol} {Quantity} @ ₹{Price:F2} - Order ID: {OrderId}",
                     trade.Symbol, quantity, trade.CurrentPrice, orderId);
-
-                // TODO: Save to database
-                await Task.CompletedTask;
             }
-            catch (Exception ex)
+
+            await Task.CompletedTask;
+        }
+
+        public void UpdateTradeOnExit(string symbol, int quantity, decimal exitPrice)
+        {
+            lock (_tradeLock)
             {
-                _logger.LogError(ex, "Error recording trade for {Symbol}", trade.Symbol);
+                var trades = _todayTrades
+                    .Where(t => t.Symbol == symbol && t.Action == "BUY" && t.ExitPrice == null)
+                    .OrderBy(t => t.Time)
+                    .Take(quantity)
+                    .ToList();
+
+                foreach (var trade in trades)
+                {
+                    trade.ExitPrice = exitPrice;
+                    trade.ExitedAt = DateTime.Now;
+                    trade.ProfitLoss = (exitPrice - trade.Price) * trade.Quantity;
+
+                    _logger.LogInformation("Trade exited: {Symbol} {Quantity} @ ₹{ExitPrice:F2}, P&L: ₹{ProfitLoss:F2}",
+                        trade.Symbol, trade.Quantity, exitPrice, trade.ProfitLoss);
+                }
             }
         }
 
@@ -365,11 +426,9 @@ namespace StockNotificationApi.Services
         {
             var now = DateTime.Now;
 
-            // Check if it's a weekday (Monday to Friday)
             if (now.DayOfWeek < DayOfWeek.Monday || now.DayOfWeek > DayOfWeek.Friday)
                 return false;
 
-            // Market hours: 9:15 AM to 3:30 PM
             var marketOpen = new DateTime(now.Year, now.Month, now.Day, 9, 15, 0);
             var marketClose = new DateTime(now.Year, now.Month, now.Day, 15, 30, 0);
 
@@ -391,5 +450,19 @@ namespace StockNotificationApi.Services
                 await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
             }
         }
+    }
+
+    public class TradeExecution
+    {
+        public string Symbol { get; set; } = string.Empty;
+        public string Action { get; set; } = string.Empty;
+        public int Quantity { get; set; }
+        public decimal Price { get; set; }
+        public DateTime Time { get; set; }
+        public string OrderId { get; set; } = string.Empty;
+        public decimal? ExitPrice { get; set; }
+        public DateTime? ExitedAt { get; set; }
+        public decimal ProfitLoss { get; set; }
+        public DateTime ExecutedAt => Time;
     }
 }

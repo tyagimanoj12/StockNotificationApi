@@ -6,30 +6,36 @@ using System.Text.Json;
 
 namespace StockNotificationApi.Services
 {
-    public class EnhancedAIService : IAIService
+    public class GeminiService : IAIService
     {
         private readonly HttpClient _httpClient;
         private readonly IConfiguration _configuration;
-        private readonly ILogger<EnhancedAIService> _logger;
+        private readonly ILogger<GeminiService> _logger;
         private readonly string _apiKey;
         private readonly string _apiUrl;
 
-        // Constants
+        // Constants from EnhancedAIService
         private const double DEFAULT_TEMPERATURE = 0.2;
         private const int DEFAULT_TOP_K = 1;
         private const int DEFAULT_TOP_P = 1;
         private const int DEFAULT_MAX_TOKENS = 2048;
         private const int RATE_LIMIT_DELAY_MS = 1000;
         private const int MAX_RETRIES = 3;
-        private const int HIGH_RISK_THRESHOLD = 3;
-        private const int MEDIUM_RISK_THRESHOLD = 1;
-        private const int STRONG_MOMENTUM_THRESHOLD = 2;
-        private const int SIGNIFICANT_DECLINE_THRESHOLD = -2;
 
-        public EnhancedAIService(
+        // Thresholds from GeminiAIService
+        private const decimal BULLISH_THRESHOLD = 1m;
+        private const decimal BEARISH_THRESHOLD = -1m;
+        private const decimal BUY_THRESHOLD = 2m;
+        private const decimal SELL_THRESHOLD = -2m;
+        private const decimal HIGH_RISK_THRESHOLD = 3m;
+        private const decimal MEDIUM_RISK_THRESHOLD = 1m;
+        private const decimal STRONG_MOMENTUM_THRESHOLD = 2m;
+        private const decimal SIGNIFICANT_DECLINE_THRESHOLD = -2m;
+
+        public GeminiService(
             HttpClient httpClient,
             IConfiguration configuration,
-            ILogger<EnhancedAIService> logger)
+            ILogger<GeminiService> logger)
         {
             _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
@@ -63,6 +69,7 @@ namespace StockNotificationApi.Services
 
             try
             {
+                // Use EnhancedAIService's better prompt
                 var prompt = BuildEnhancedPrompt(stockData);
                 var aiResponse = await CallGeminiAPIWithRetry(prompt);
 
@@ -72,6 +79,7 @@ namespace StockNotificationApi.Services
                     return GenerateFallbackPredictions(stockData);
                 }
 
+                // Use EnhancedAIService's better parsing
                 return ParseAIResponse(aiResponse, stockData);
             }
             catch (Exception ex)
@@ -81,16 +89,61 @@ namespace StockNotificationApi.Services
             }
         }
 
+        public async Task<string> GetMarketInsightAsync(List<StockData> stockData)
+        {
+            if (stockData == null || !stockData.Any())
+            {
+                return "No market data available for analysis.";
+            }
+
+            try
+            {
+                var avgChange = stockData.Average(s => s.ChangePercent);
+                var topGainer = stockData.OrderByDescending(s => s.ChangePercent).FirstOrDefault();
+                var topLoser = stockData.OrderBy(s => s.ChangePercent).FirstOrDefault();
+                var positiveCount = stockData.Count(s => s.ChangePercent > 0);
+                var negativeCount = stockData.Count(s => s.ChangePercent < 0);
+
+                var prompt = $@"
+Based on today's Indian stock market data:
+- Average change: {avgChange:F2}%
+- Top gainer: {topGainer?.Name ?? "N/A"} ({topGainer?.ChangePercent:F2}%)
+- Top loser: {topLoser?.Name ?? "N/A"} ({topLoser?.ChangePercent:F2}%)
+- Number of stocks positive: {positiveCount}
+- Number of stocks negative: {negativeCount}
+
+Provide a concise market insight (2-3 sentences) highlighting:
+1. Overall market sentiment
+2. Which sectors are leading/lagging
+3. What investors should watch tomorrow";
+
+                var insight = await CallGeminiAPIWithRetry(prompt);
+                return string.IsNullOrEmpty(insight) ? GetFallbackMarketInsight(stockData) : insight;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting market insight");
+                return GetFallbackMarketInsight(stockData);
+            }
+        }
+
+        // From EnhancedAIService - Better prompt with more data
         private string BuildEnhancedPrompt(List<StockData> stockData)
         {
             if (stockData == null) return string.Empty;
 
             var sb = new StringBuilder();
 
-            sb.AppendLine("You are an expert Indian stock market analyst. Provide accurate, data-driven predictions.\n");
+            sb.AppendLine("You are an expert Indian stock market analyst with 20 years of experience.");
+            sb.AppendLine("Provide accurate, data-driven predictions based on the following data.\n");
+
+            sb.AppendLine($"## MARKET OVERVIEW");
+            sb.AppendLine($"Date: {DateTime.Now:dd MMM yyyy}");
+            sb.AppendLine($"Total Stocks: {stockData.Count}\n");
+
             sb.AppendLine("## CURRENT MARKET DATA");
 
-            foreach (var stock in stockData.Where(s => s != null))
+            foreach (var stock in stockData.Where(s => s != null).Take(20)) // Limit to 20 stocks
             {
                 sb.AppendLine($"\nStock: {EscapeText(stock.Name)} ({EscapeText(stock.Symbol)})");
                 sb.AppendLine($"- Current Price: ₹{stock.Price:F2}");
@@ -98,17 +151,20 @@ namespace StockNotificationApi.Services
                 sb.AppendLine($"- Day Range: ₹{stock.DayLow:F2} - ₹{stock.DayHigh:F2}");
                 sb.AppendLine($"- Volume: {stock.Volume:N0}");
                 sb.AppendLine($"- 52W Range: ₹{stock.YearLow:F2} - ₹{stock.YearHigh:F2}");
+                if (stock.PE.HasValue)
+                    sb.AppendLine($"- P/E Ratio: {stock.PE:F2}");
+                sb.AppendLine($"- Sector: {stock.Sector}");
             }
 
             sb.AppendLine("\n## ANALYSIS REQUIREMENTS");
-            sb.AppendLine("For EACH stock, provide EXACTLY this format:");
+            sb.AppendLine("For EACH stock, provide EXACTLY this format (one per line):");
             sb.AppendLine("SYMBOL: [symbol]");
             sb.AppendLine("PREDICTION: [Bullish/Bearish/Neutral]");
             sb.AppendLine("RECOMMENDATION: [Buy/Hold/Sell]");
             sb.AppendLine("CONFIDENCE: [High/Medium/Low]");
+            sb.AppendLine("TARGET: [price target for next week in ₹]");
+            sb.AppendLine("STOP_LOSS: [stop loss price in ₹]");
             sb.AppendLine("REASON: [2-3 sentences explaining key factors]");
-            sb.AppendLine("TARGET: [price target for next week]");
-            sb.AppendLine("STOP_LOSS: [stop loss price]");
             sb.AppendLine("---");
 
             sb.AppendLine("\n## ADDITIONAL");
@@ -199,6 +255,7 @@ namespace StockNotificationApi.Services
             }
         }
 
+        // From EnhancedAIService - Better parsing
         private DailyPredictionReport ParseAIResponse(string aiResponse, List<StockData> stockData)
         {
             var report = new DailyPredictionReport
@@ -322,6 +379,7 @@ namespace StockNotificationApi.Services
             return "Low";
         }
 
+        // Fallback methods from both
         private DailyPredictionReport GenerateFallbackPredictions(List<StockData> stockData)
         {
             if (stockData == null || !stockData.Any())
@@ -397,45 +455,6 @@ namespace StockNotificationApi.Services
             return prediction;
         }
 
-        public async Task<string> GetMarketInsightAsync(List<StockData> stockData)
-        {
-            if (stockData == null || !stockData.Any())
-            {
-                return "No market data available for analysis.";
-            }
-
-            try
-            {
-                var avgChange = stockData.Average(s => s.ChangePercent);
-                var topGainer = stockData.OrderByDescending(s => s.ChangePercent).FirstOrDefault();
-                var topLoser = stockData.OrderBy(s => s.ChangePercent).FirstOrDefault();
-                var positiveCount = stockData.Count(s => s.ChangePercent > 0);
-                var negativeCount = stockData.Count(s => s.ChangePercent < 0);
-
-                var prompt = $@"
-                    Based on today's Indian stock market data:
-                    - Average change: {avgChange:F2}%
-                    - Top gainer: {topGainer?.Name ?? "N/A"} ({topGainer?.ChangePercent:F2}%)
-                    - Top loser: {topLoser?.Name ?? "N/A"} ({topLoser?.ChangePercent:F2}%)
-                    - Number of stocks positive: {positiveCount}
-                    - Number of stocks negative: {negativeCount}
-
-                    Provide a concise market insight (2-3 sentences) highlighting:
-                    1. Overall market sentiment
-                    2. Which sectors are leading/lagging
-                    3. What investors should watch tomorrow
-                ";
-
-                var insight = await CallGeminiAPIWithRetry(prompt);
-                return string.IsNullOrEmpty(insight) ? GetFallbackMarketInsight(stockData) : insight;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting market insight");
-                return GetFallbackMarketInsight(stockData);
-            }
-        }
-
         private string GetFallbackMarketInsight(List<StockData> stockData)
         {
             if (stockData == null || !stockData.Any())
@@ -467,7 +486,6 @@ namespace StockNotificationApi.Services
         {
             if (string.IsNullOrEmpty(text)) return string.Empty;
 
-            // Remove any potentially problematic characters
             return text.Replace("\"", "'")
                       .Replace("\n", " ")
                       .Replace("\r", " ")

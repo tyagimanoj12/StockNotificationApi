@@ -1,6 +1,7 @@
 ﻿using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
+using System.Text.Json;
 
 namespace StockNotificationApi.Services
 {
@@ -13,7 +14,7 @@ namespace StockNotificationApi.Services
         private readonly IPortfolioService _portfolioService;
         private readonly ILogger<DailyBriefingService> _logger;
         private readonly ITelegramBotService _telegramBot;
-        private readonly IHttpClientFactory _httpClientFactory; // Added for proper HTTP client management
+        private readonly IHttpClientFactory _httpClientFactory;
 
         // Constants
         private const int LARGE_CAP_THRESHOLD = 20000;
@@ -23,6 +24,11 @@ namespace StockNotificationApi.Services
         private const int PORTFOLIO_DISPLAY_LIMIT = 5;
         private const int RATE_LIMIT_DELAY_MS = 100;
 
+        // Yahoo Finance symbols for Indian indices
+        private const string YAHOO_NIFTY_SYMBOL = "^NSEI";
+        private const string YAHOO_SENSEX_SYMBOL = "^BSESN";
+        private const string YAHOO_BANKNIFTY_SYMBOL = "^NSEBANK";
+
         public DailyBriefingService(
             IStockService stockService,
             IStockListService stockListService,
@@ -30,7 +36,7 @@ namespace StockNotificationApi.Services
             INewsService newsService,
             IPortfolioService portfolioService,
             ITelegramBotService telegramBot,
-            IHttpClientFactory httpClientFactory, // Added
+            IHttpClientFactory httpClientFactory,
             ILogger<DailyBriefingService> logger)
         {
             _stockService = stockService ?? throw new ArgumentNullException(nameof(stockService));
@@ -166,7 +172,7 @@ namespace StockNotificationApi.Services
 
                         await _telegramBot.SendMessageAsync(portfolio.ChatId, personalizedMessage);
                         successCount++;
-                        await Task.Delay(RATE_LIMIT_DELAY_MS); // Rate limiting
+                        await Task.Delay(RATE_LIMIT_DELAY_MS);
                     }
                     catch (Exception ex)
                     {
@@ -264,7 +270,8 @@ namespace StockNotificationApi.Services
         {
             if (index != null)
             {
-                sb.AppendLine($"{name}: {index.Value:F2} {GetChangeEmoji(index.ChangePercent)} {index.ChangePercent:F2}%");
+                var emoji = index.ChangePercent >= 0 ? "🟢" : "🔴";
+                sb.AppendLine($"{name}: {index.Value:N2} {emoji} {index.ChangePercent:+#.##;-#.##;0}%");
             }
         }
 
@@ -273,9 +280,15 @@ namespace StockNotificationApi.Services
             if (picks?.Any() == true)
             {
                 sb.AppendLine($"<b>{title}</b>");
-                foreach (var stock in picks)
+                foreach (var stock in picks.Take(3)) // Show top 3 picks per category
                 {
-                    sb.AppendLine($"• <b>{stock.Symbol}</b>: {stock.Recommendation} (Confidence: {stock.Confidence})");
+                    var confidenceEmoji = stock.Confidence?.ToLower() switch
+                    {
+                        "high" => "🔴",
+                        "medium" => "🟡",
+                        _ => "⚪"
+                    };
+                    sb.AppendLine($"• <b>{stock.Symbol}</b>: {stock.Recommendation} {confidenceEmoji}");
                     if (stock.KeyFactors?.Any() == true)
                     {
                         sb.AppendLine($"  <i>{stock.KeyFactors.First()}</i>");
@@ -289,29 +302,139 @@ namespace StockNotificationApi.Services
         {
             var indices = new MarketIndices
             {
-                Nifty50 = new IndexData { Name = "Nifty 50", Value = 0, Change = 0, ChangePercent = 0 },
-                Sensex = new IndexData { Name = "Sensex", Value = 0, Change = 0, ChangePercent = 0 },
-                BankNifty = new IndexData { Name = "Bank Nifty", Value = 0, Change = 0, ChangePercent = 0 }
+                Nifty50 = new IndexData { Name = "Nifty 50" },
+                Sensex = new IndexData { Name = "Sensex" },
+                BankNifty = new IndexData { Name = "Bank Nifty" }
             };
 
             try
             {
                 var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
                 client.Timeout = TimeSpan.FromSeconds(30);
 
-                // TODO: Implement actual Yahoo Finance parsing
-                // For now, return sample data
-                indices.Nifty50 = new IndexData { Name = "Nifty 50", Value = 22456.80m, Change = 123.45m, ChangePercent = 0.55m };
-                indices.Sensex = new IndexData { Name = "Sensex", Value = 73896.55m, Change = 345.67m, ChangePercent = 0.47m };
-                indices.BankNifty = new IndexData { Name = "Bank Nifty", Value = 48567.90m, Change = 234.56m, ChangePercent = 0.48m };
+                // Fetch all indices in parallel
+                var tasks = new[]
+                {
+                    GetIndexDataAsync(client, YAHOO_NIFTY_SYMBOL),
+                    GetIndexDataAsync(client, YAHOO_SENSEX_SYMBOL),
+                    GetIndexDataAsync(client, YAHOO_BANKNIFTY_SYMBOL)
+                };
+
+                var results = await Task.WhenAll(tasks);
+
+                if (results[0] != null) indices.Nifty50 = results[0];
+                if (results[1] != null) indices.Sensex = results[1];
+                if (results[2] != null) indices.BankNifty = results[2];
+
+                _logger.LogInformation("Indices fetched successfully - Nifty: {Nifty}, Sensex: {Sensex}, BankNifty: {BankNifty}",
+                    indices.Nifty50.Value, indices.Sensex.Value, indices.BankNifty.Value);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error fetching indices");
+                _logger.LogError(ex, "Error fetching indices, using fallback data");
+                return GetFallbackIndices();
             }
 
             return indices;
+        }
+
+        private async Task<IndexData?> GetIndexDataAsync(HttpClient client, string symbol)
+        {
+            try
+            {
+                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d";
+                var response = await client.GetAsync(url);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogWarning("Failed to fetch {Symbol}: {StatusCode}", symbol, response.StatusCode);
+                    return null;
+                }
+
+                var content = await response.Content.ReadAsStringAsync();
+                using var jsonDoc = JsonDocument.Parse(content);
+                var root = jsonDoc.RootElement;
+
+                // Navigate to the quote data
+                if (root.TryGetProperty("chart", out var chart) &&
+                    chart.TryGetProperty("result", out var result) &&
+                    result.ValueKind == JsonValueKind.Array &&
+                    result.GetArrayLength() > 0)
+                {
+                    var firstResult = result[0];
+
+                    if (firstResult.TryGetProperty("meta", out var meta))
+                    {
+                        var indexData = new IndexData
+                        {
+                            Name = GetIndexName(symbol),
+                            Value = meta.TryGetProperty("regularMarketPrice", out var price) ?
+                                    price.GetDecimal() : 0,
+                            PreviousClose = meta.TryGetProperty("previousClose", out var prevClose) ?
+                                           prevClose.GetDecimal() : 0
+                        };
+
+                        // Calculate change and change percent
+                        indexData.Change = indexData.Value - indexData.PreviousClose;
+                        indexData.ChangePercent = indexData.PreviousClose > 0 ?
+                            (indexData.Change / indexData.PreviousClose) * 100 : 0;
+
+                        return indexData;
+                    }
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing index data for {Symbol}", symbol);
+                return null;
+            }
+        }
+
+        private string GetIndexName(string symbol)
+        {
+            return symbol switch
+            {
+                "^NSEI" => "Nifty 50",
+                "^BSESN" => "Sensex",
+                "^NSEBANK" => "Bank Nifty",
+                _ => symbol
+            };
+        }
+
+        private MarketIndices GetFallbackIndices()
+        {
+            _logger.LogWarning("Using fallback index data");
+
+            return new MarketIndices
+            {
+                Nifty50 = new IndexData
+                {
+                    Name = "Nifty 50",
+                    Value = 22456.80m,
+                    PreviousClose = 22333.35m,
+                    Change = 123.45m,
+                    ChangePercent = 0.55m
+                },
+                Sensex = new IndexData
+                {
+                    Name = "Sensex",
+                    Value = 73896.55m,
+                    PreviousClose = 73550.88m,
+                    Change = 345.67m,
+                    ChangePercent = 0.47m
+                },
+                BankNifty = new IndexData
+                {
+                    Name = "Bank Nifty",
+                    Value = 48567.90m,
+                    PreviousClose = 48333.34m,
+                    Change = 234.56m,
+                    ChangePercent = 0.48m
+                }
+            };
         }
 
         private async Task<(List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap)>
@@ -354,7 +477,7 @@ namespace StockNotificationApi.Services
                 if (predictions?.Predictions == null) return new List<StockPrediction>();
 
                 return predictions.Predictions
-                    .Where(p => p != null && (p.Recommendation == "Buy" || p.Recommendation == "Strong Buy"))
+                    .Where(p => p != null && (p.Recommendation?.Equals("Buy", StringComparison.OrdinalIgnoreCase) == true))
                     .OrderByDescending(p => GetConfidenceScore(p.Confidence))
                     .ThenByDescending(p => p.CurrentPrice)
                     .Take(count)
@@ -418,7 +541,8 @@ namespace StockNotificationApi.Services
             if (smallCap?.Any() == true) allPicks.AddRange(smallCap);
 
             var topPick = allPicks
-                .Where(p => p != null && p.Recommendation == "Buy" && p.Confidence == "High")
+                .Where(p => p != null && p.Recommendation?.Equals("Buy", StringComparison.OrdinalIgnoreCase) == true &&
+                           p.Confidence?.Equals("High", StringComparison.OrdinalIgnoreCase) == true)
                 .OrderByDescending(p => p.CurrentPrice)
                 .FirstOrDefault();
 

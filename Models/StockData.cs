@@ -655,6 +655,7 @@ namespace StockNotificationApi.Models
         public decimal Value { get; set; }
         public decimal Change { get; set; }
         public decimal ChangePercent { get; set; }
+        public decimal PreviousClose { get; set; } // Add this property
     }
 
     #endregion
@@ -1162,36 +1163,40 @@ namespace StockNotificationApi.Models
         public string uniqueorderid { get; set; } = string.Empty;
     }
 
-    /// <summary>
-    /// Angel One holdings response
-    /// </summary>
     public class AngelOneHoldingsResponse
     {
         public bool status { get; set; }
-        public string message { get; set; } = string.Empty;
-        public string errorCode { get; set; } = string.Empty;
-        public List<AngelOneHolding> data { get; set; } = new();
+        public string message { get; set; }
+        public string errorcode { get; set; }
+        public List<AngelOneHolding> data { get; set; }
     }
 
-    /// <summary>
-    /// Angel One holding
-    /// </summary>
     public class AngelOneHolding
     {
-        public string tradingsymbol { get; set; } = string.Empty;
-        public string symboltoken { get; set; } = string.Empty;
-        public string exchange { get; set; } = string.Empty;
-        public int quantity { get; set; }
+        public string tradingsymbol { get; set; }
+        public string exchange { get; set; }
+        public string isin { get; set; }
         public int t1quantity { get; set; }
+        public int realisedquantity { get; set; }
+        public int quantity { get; set; }
+        public int authorisedquantity { get; set; }
+        public string product { get; set; }
+        public object collateralquantity { get; set; }
+        public object collateraltype { get; set; }
+        public decimal haircut { get; set; }
         public decimal averageprice { get; set; }
         public decimal ltp { get; set; }
-        public decimal profitloss { get; set; }
-        public decimal realisedquantity { get; set; }
-        public string producttype { get; set; } = string.Empty;
-        public string collateralkey { get; set; } = string.Empty;
-        public string holdingcost { get; set; } = string.Empty;
-    }
+        public string symboltoken { get; set; }
+        public decimal close { get; set; }
+        // Keep both for compatibility
+        public decimal profitandloss { get; set; }
+        public decimal? profitloss { get; set; }
 
+        // Add a helper property
+        [JsonIgnore]
+        public decimal EffectiveProfitLoss => profitloss ?? profitandloss;
+        public decimal pnlpercentage { get; set; }
+    }
     /// <summary>
     /// Angel One positions response
     /// </summary>

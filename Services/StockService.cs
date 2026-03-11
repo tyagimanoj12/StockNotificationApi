@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Primitives;
+﻿// Services/StockService.cs
+using Microsoft.Extensions.Primitives;
 using Newtonsoft.Json.Linq;
 using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
@@ -15,6 +16,7 @@ namespace StockNotificationApi.Services
         private readonly ILogger<StockService> _logger;
         private readonly StockApiSettings _stockApiSettings;
         private readonly IStockListService _stockListService;
+        private readonly ICacheService _cache; // Add this
 
         // Constants
         private const int RATE_LIMIT_DELAY_MS = 300;
@@ -30,11 +32,13 @@ namespace StockNotificationApi.Services
             IHttpClientFactory httpClientFactory,
             IConfiguration configuration,
             IStockListService stockListService,
+            ICacheService cache, // Add this
             ILogger<StockService> logger)
         {
             _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
             _stockListService = stockListService ?? throw new ArgumentNullException(nameof(stockListService));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
             _stockApiSettings = configuration.GetSection("StockApiSettings").Get<StockApiSettings>()
@@ -42,6 +46,15 @@ namespace StockNotificationApi.Services
         }
 
         public async Task<List<StockData>> GetIndianStockDataAsync()
+        {
+            return await _cache.GetOrSetAsync(
+                "all_stocks_data",
+                async () => await FetchAllStocksDataAsync(),
+                TimeSpan.FromMinutes(15)
+            ) ?? new List<StockData>();
+        }
+
+        private async Task<List<StockData>> FetchAllStocksDataAsync()
         {
             _logger.LogInformation("Fetching stocks for market analysis...");
 
@@ -103,6 +116,15 @@ namespace StockNotificationApi.Services
                 return null;
             }
 
+            return await _cache.GetOrSetAsync(
+                $"stock:{symbol}",
+                async () => await FetchStockDataAsync(symbol),
+                TimeSpan.FromMinutes(5)
+            );
+        }
+
+        private async Task<StockData?> FetchStockDataAsync(string symbol)
+        {
             _logger.LogInformation("Fetching data for {Symbol} with fallback", symbol);
 
             // Clean the symbol (remove any exchange suffixes)
@@ -167,6 +189,9 @@ namespace StockNotificationApi.Services
             _logger.LogError("All data sources failed for {Symbol}", cleanSymbol);
             return null;
         }
+
+        // Rest of the methods remain the same...
+        // (Keep all the existing implementation methods: GetFromNSEAsync, MapNSEResponse, etc.)
 
         #region NSE API Implementation
 

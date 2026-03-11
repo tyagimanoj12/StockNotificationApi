@@ -1055,6 +1055,14 @@ namespace StockNotificationApi.Models
         public decimal RiskReward { get; set; }
         public decimal PotentialReturn { get; set; }
         public string Reason { get; set; } = string.Empty;
+        public int Quantity { get; set; }
+    }
+
+    public class BuyRecommendation
+    {
+        public TradeItem Trade { get; set; }
+        public int RecommendedQuantity { get; set; }
+        public decimal TotalCost => RecommendedQuantity * Trade.CurrentPrice;
     }
 
     /// <summary>

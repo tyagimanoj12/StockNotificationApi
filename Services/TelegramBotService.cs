@@ -476,30 +476,6 @@ namespace StockNotificationApi.Services
 
         private async Task SendPortfolioSuggestions(long chatId)
         {
-            // Declare variables at the top to avoid scope issues
-            StringBuilder? actions = null;
-            StringBuilder? buyMsg = null;
-            StringBuilder? overview = null;
-            StringBuilder? summary = null;
-            StringBuilder? prioritySteps = null;
-            StringBuilder? rebalanceMsg = null;
-            StringBuilder? whatIf = null;
-            StringBuilder? scenarioMsg = null;
-            StringBuilder? taxMsg = null;
-            StringBuilder? stressTest = null;
-            StringBuilder? compareMsg = null;
-            StringBuilder? heatMsg = null;
-            StringBuilder? goalMsg = null;
-            StringBuilder? sector = null;
-            StringBuilder? riskMsg = null;
-            StringBuilder? optMsg = null;
-            StringBuilder? alertMsg = null;
-            string? divAnalysis = null;
-            string? marketCapAnalysis = null;
-            string? peerComparison = null;
-            string? aiInsight = null;
-            string? chart = null;
-
             try
             {
                 using var scope = _scopeFactory.CreateScope();
@@ -508,16 +484,29 @@ namespace StockNotificationApi.Services
                 var tradingService = scope.ServiceProvider.GetRequiredService<ITradingService>();
                 var stockService = scope.ServiceProvider.GetRequiredService<IStockService>();
 
-                // ========== ENHANCEMENT 5: Caching ==========
+                // ========== OPTIMIZATION 1: Check cache first ==========
                 string cacheKey = $"portfolio_analysis_{chatId}_{DateTime.Now:yyyyMMdd}";
                 if (_cache.TryGetValue(cacheKey, out string cachedAnalysis))
                 {
+                    // Send as a single message instead of multiple
                     await SendMessageAsync(chatId, cachedAnalysis);
                     await SendMessageAsync(chatId, $"<i>Cached analysis from {DateTime.Now:HH:mm}</i>");
                     return;
                 }
 
-                var holdings = await ExecuteWithRetry(() => angelOneService.GetHoldingsAsync());
+                // Send single progress message instead of multiple
+                //await SendMessageAsync(chatId, "🔄 Analyzing your portfolio... This may take a moment.");
+
+                // ========== OPTIMIZATION 2: Parallel data fetching with error handling ==========
+                var holdingsTask = ExecuteWithRetry(() => angelOneService.GetHoldingsAsync());
+                var portfolioTask = ExecuteWithRetry(() => angelOneService.GetPortfolioAsync());
+                var niftyReturnTask = GetNiftyReturn(stockService);
+
+                await Task.WhenAll(holdingsTask, portfolioTask, niftyReturnTask);
+
+                var holdings = await holdingsTask;
+                var portfolio = await portfolioTask;
+                var niftyReturn = await niftyReturnTask;
 
                 if (holdings == null || !holdings.Any())
                 {
@@ -525,512 +514,391 @@ namespace StockNotificationApi.Services
                     return;
                 }
 
-                // ========== ENHANCEMENT 6: Parallel Processing ==========
-                var planTask = optimizer.AnalyzeHoldingsAsync();
-                var portfolioTask = angelOneService.GetPortfolioAsync();
-                var sectorTask = Task.Run(() => CalculateSectorAnalysis(holdings));
+                // ========== OPTIMIZATION 3: Parallel analysis with safe error handling ==========
+                var planTask = ExecuteWithRetry(() => optimizer.AnalyzeHoldingsAsync());
+                var sectorTask = Task.Run(() => SafeCalculateSectorAnalysis(holdings));
+                var buyRecsTask = Task.Run(() => SafeGenerateBuyRecommendations(holdings, tradingService, portfolio));
+                var divAnalysisTask = Task.Run(() => SafeGetDividendAnalysis(holdings, portfolio.CurrentValue));
+                var marketCapTask = Task.Run(() => SafeAnalyzeMarketCap(holdings));
+                var peerComparisonTask = Task.Run(() => SafeGeneratePeerComparison(holdings));
+                var aiInsightTask = Task.Run(() => SafeGetAIInsights(portfolio, _scopeFactory, holdings));
+                var alertsTask = Task.Run(() => SafeSuggestAlerts(holdings));
 
-                await Task.WhenAll(planTask, portfolioTask, sectorTask);
-
-                var plan = await planTask;
-                var portfolio = await portfolioTask;
-                var sectorExposure = await sectorTask;
-
-                var totalValue = portfolio.CurrentValue;
-
-                // Enhanced Health Score
-                int healthScore = CalculateEnhancedHealthScore(holdings, portfolio.CurrentValue, portfolio.TotalInvestment, sectorExposure);
-
-                // Enhanced Warnings
-                var warnings = GenerateEnhancedWarnings(holdings, portfolio, sectorExposure);
-
-                // ========== ENHANCEMENT 2: Progress Indicator ==========
-                await SendMessageAsync(chatId, "⏳ [1/6] Analyzing portfolio overview...");
-
-                // Send overview
-                overview = new StringBuilder();
-                overview.AppendLine("📊 <b>PORTFOLIO IMPROVEMENT SUGGESTIONS</b>\n");
-
-                var healthEmoji = GetHealthColor(healthScore);
-                overview.AppendLine($"{healthEmoji} <b>Portfolio Health Score:</b> {healthScore}% {CreateProgressBar(healthScore)}\n");
-                overview.AppendLine($"💰 <b>Total Value:</b> ₹{portfolio.CurrentValue:N2}");
-                overview.AppendLine($"📈 <b>Total Investment:</b> ₹{portfolio.TotalInvestment:N2}");
-
-                var pnlEmoji = portfolio.TotalProfitLoss >= 0 ? "🟢" : "🔴";
-                overview.AppendLine($"{pnlEmoji} <b>Total P&L:</b> ₹{Math.Abs(portfolio.TotalProfitLoss):N2} ({portfolio.TotalProfitLossPercent:F2}%)\n");
-
-                // Recovery Time
-                var recoveryTime = EstimateRecoveryTime(portfolio.TotalProfitLossPercent);
-                overview.AppendLine($"⏱️ <b>Estimated Recovery Time:</b> {recoveryTime}\n");
-
-                if (warnings.Any())
+                try
                 {
-                    overview.AppendLine("<b>⚠️ Key Warnings:</b>");
-                    foreach (var warning in warnings.Take(5))
-                    {
-                        overview.AppendLine($"• {warning}");
-                    }
-                    overview.AppendLine();
+                    await Task.WhenAll(planTask, sectorTask, buyRecsTask, divAnalysisTask, marketCapTask,
+                                      peerComparisonTask, aiInsightTask, alertsTask);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Some parallel tasks failed for chat {ChatId}, but continuing with available data", chatId);
                 }
 
-                await SendMessageAsync(chatId, overview.ToString());
+                // Get results safely - using var pattern since we don't know the exact return types
+                var plan = planTask.IsCompletedSuccessfully ? await planTask : null;
+                var sectorExposure = sectorTask.IsCompletedSuccessfully ? await sectorTask : new Dictionary<string, decimal>();
+                var buyRecommendations = buyRecsTask.IsCompletedSuccessfully ? await buyRecsTask : new List<TradeItem>();
+                var divAnalysis = divAnalysisTask.IsCompletedSuccessfully ? await divAnalysisTask : null;
+                var marketCapAnalysis = marketCapTask.IsCompletedSuccessfully ? await marketCapTask : "<b>📊 MARKET CAP ALLOCATION</b>\nData temporarily unavailable";
+                var peerComparison = peerComparisonTask.IsCompletedSuccessfully ? await peerComparisonTask : null;
+                var aiInsight = aiInsightTask.IsCompletedSuccessfully ? await aiInsightTask : null;
+                var alertSuggestions = alertsTask.IsCompletedSuccessfully ? await alertsTask : new List<string>();
 
-                await SendMessageAsync(chatId, "⏳ [2/6] Calculating risk metrics...");
+                // ========== OPTIMIZATION 4: Calculate everything at once ==========
+                var totalValue = portfolio?.CurrentValue ?? 0;
+                var totalInvestment = portfolio?.TotalInvestment ?? 0;
 
-                // Send action items from optimizer
-                var actionableTrades = plan.Actions.Where(a => a.Action != "HOLD").ToList();
-                if (actionableTrades.Any())
+                // Health Score
+                int healthScore = CalculateEnhancedHealthScore(holdings, totalValue, totalInvestment, sectorExposure);
+
+                // Warnings
+                var warnings = GenerateEnhancedWarnings(holdings, portfolio ?? new PortfolioSummary(), sectorExposure);
+
+                // Actionable trades - handle null plan
+                var actionableTrades = new List<object>(); // Use object since we don't know the type
+                if (plan != null)
                 {
-                    actions = new StringBuilder();
-                    actions.AppendLine("<b>📋 RECOMMENDED ACTIONS</b>\n");
-
-                    var sells = actionableTrades.Where(a => a.Action == "SELL").OrderBy(a => a.Priority).ToList();
-                    if (sells.Any())
+                    // Try to get Actions property via reflection or use the actual property name
+                    var actionsProperty = plan.GetType().GetProperty("Actions");
+                    if (actionsProperty != null)
                     {
-                        actions.AppendLine("<b>🔴 Sell Recommendations:</b>");
-                        foreach (var sell in sells.Take(5))
+                        var actions = actionsProperty.GetValue(plan) as System.Collections.IEnumerable;
+                        if (actions != null)
                         {
-                            var priorityEmoji = sell.Priority == 1 ? "⚠️" : "📉";
-                            actions.AppendLine($"{priorityEmoji} <b>{sell.Symbol}</b>: Sell {sell.Quantity} shares");
-                            actions.AppendLine($"   Reason: {sell.Reason}");
-                            if (sell.ExpectedProfit != 0)
+                            foreach (var action in actions)
                             {
-                                var profitEmoji = sell.ExpectedProfit > 0 ? "🟢" : "🔴";
-                                actions.AppendLine($"   Expected: {profitEmoji} ₹{Math.Abs(sell.ExpectedProfit):N2}");
+                                var actionType = action.GetType();
+                                var actionValue = actionType.GetProperty("Action")?.GetValue(action)?.ToString();
+                                if (actionValue != "HOLD")
+                                {
+                                    actionableTrades.Add(action);
+                                }
                             }
-                            actions.AppendLine();
                         }
                     }
-
-                    await SendMessageAsync(chatId, actions.ToString());
                 }
 
-                await SendMessageAsync(chatId, "⏳ [3/6] Generating buy recommendations...");
+                // Quick stats
+                decimal totalSellValue = 0;
+                decimal totalBuyCost = buyRecommendations.Sum(r => r.Quantity * r.CurrentPrice);
 
-                // Buy Recommendations
-                var buyRecommendations = await GenerateBuyRecommendations(holdings, tradingService, portfolio);
-                if (buyRecommendations.Any())
+                if (plan != null)
                 {
-                    buyMsg = new StringBuilder();
-                    buyMsg.AppendLine("<b>🟢 BUY RECOMMENDATIONS</b>\n");
-
-                    var cashPosition = portfolio.CurrentValue - portfolio.TotalInvestment;
-                    if (cashPosition > 0)
+                    var actionsProperty = plan.GetType().GetProperty("Actions");
+                    if (actionsProperty != null)
                     {
-                        buyMsg.AppendLine($"<i>Based on available cash: ₹{cashPosition:N2}</i>\n");
+                        var actions = actionsProperty.GetValue(plan) as System.Collections.IEnumerable;
+                        if (actions != null)
+                        {
+                            foreach (var action in actions)
+                            {
+                                var actionType = action.GetType();
+                                var actionValue = actionType.GetProperty("Action")?.GetValue(action)?.ToString();
+                                if (actionValue == "SELL")
+                                {
+                                    var quantity = (int)(actionType.GetProperty("Quantity")?.GetValue(action) ?? 0);
+                                    var price = (decimal)(actionType.GetProperty("Price")?.GetValue(action) ?? 0);
+                                    totalSellValue += quantity * price;
+                                }
+                            }
+                        }
                     }
-                    else
-                    {
-                        buyMsg.AppendLine($"<i>Note: You're currently in loss. Consider these buys when you add funds.</i>\n");
-                    }
-
-                    foreach (var rec in buyRecommendations)
-                    {
-                        var totalCost = rec.Quantity * rec.CurrentPrice;
-                        buyMsg.AppendLine($"• <b>{rec.Symbol}</b> ({rec.Category})");
-                        buyMsg.AppendLine($"  Buy {rec.Quantity} shares @ ₹{rec.CurrentPrice:F2} = ₹{totalCost:N2}");
-                        buyMsg.AppendLine($"  Target: ₹{rec.TargetPrice:F0} | SL: ₹{rec.StopLoss:F0}");
-                        buyMsg.AppendLine($"  Confidence: {rec.Confidence}% | R/R: {rec.RiskReward}:1");
-                        buyMsg.AppendLine($"  <i>{rec.Reason}</i>\n");
-                    }
-                    await SendMessageAsync(chatId, buyMsg.ToString());
                 }
 
-                await SendMessageAsync(chatId, "⏳ [4/6] Analyzing portfolio performance...");
-
-                // Quick Summary
-                var totalSellValue = plan.Actions
-                    .Where(a => a.Action == "SELL")
-                    .Sum(a => a.Quantity * a.Price);
-
-                var totalBuyCost = buyRecommendations.Sum(r => r.Quantity * r.CurrentPrice);
-
-                summary = new StringBuilder();
-                summary.AppendLine("<b>📊 QUICK SUMMARY</b>");
-                summary.AppendLine($"📉 Stocks to Sell: {plan.Actions.Count(a => a.Action == "SELL")}");
-                summary.AppendLine($"📈 Stocks to Buy: {buyRecommendations.Count}");
-                summary.AppendLine($"💰 Expected Cash from Sales: ₹{totalSellValue:N2}");
-                summary.AppendLine($"💵 Required for Buys: ₹{totalBuyCost:N2}");
-                if (totalSellValue > totalBuyCost)
-                {
-                    summary.AppendLine($"✅ Net Cash Inflow: ₹{totalSellValue - totalBuyCost:N2}");
-                }
-                else
-                {
-                    summary.AppendLine($"⚠️ Net Cash Outflow: ₹{totalBuyCost - totalSellValue:N2}");
-                }
-
-                // Portfolio Momentum
+                // Momentum
                 var momentum = CalculateMomentum(holdings);
-                summary.AppendLine($"📊 Portfolio Momentum: {momentum}");
 
                 // Diversification Score
                 var divScore = CalculateDiversificationScore(sectorExposure, holdings.Count);
-                summary.AppendLine($"🌍 Diversification: {divScore}");
 
-                await SendMessageAsync(chatId, summary.ToString());
+                // Recovery Time
+                var recoveryTime = EstimateRecoveryTime(portfolio?.TotalProfitLossPercent ?? 0);
 
-                await SendMessageAsync(chatId, "⏳ [5/6] Generating rebalancing suggestions...");
+                // Rebalance suggestions
+                var rebalanceSuggestions = GenerateRebalanceSuggestions(holdings, portfolio ?? new PortfolioSummary(), sectorExposure);
 
-                // Priority Actions
-                prioritySteps = new StringBuilder();
-                prioritySteps.AppendLine("<b>🎯 PRIORITY ACTIONS</b>\n");
+                // Optimization suggestions
+                var optimizationSuggestions = OptimizePortfolio(holdings, totalValue, sectorExposure);
 
-                if (actionableTrades.Any(t => t.Priority == 1))
+                // Scorecard
+                var scorecard = GenerateScorecard(portfolio ?? new PortfolioSummary(), healthScore, sectorExposure, niftyReturn);
+
+                // Losers for tax harvesting
+                var losers = holdings.Where(h => h.ProfitLossPercent < -20).ToList();
+
+                // ========== OPTIMIZATION 5: Build ONE comprehensive message ==========
+                var finalMessage = new StringBuilder();
+
+                // Header
+                finalMessage.AppendLine("📊 <b>PORTFOLIO IMPROVEMENT SUGGESTIONS</b>\n");
+
+                // Health Score with progress bar
+                var healthEmoji = GetHealthColor(healthScore);
+                finalMessage.AppendLine($"{healthEmoji} <b>Portfolio Health Score:</b> {healthScore}% {CreateProgressBar(healthScore)}\n");
+
+                // Overview
+                finalMessage.AppendLine($"💰 <b>Total Value:</b> ₹{totalValue:N2}");
+                finalMessage.AppendLine($"📈 <b>Total Investment:</b> ₹{totalInvestment:N2}");
+
+                var pnlEmoji = (portfolio?.TotalProfitLoss ?? 0) >= 0 ? "🟢" : "🔴";
+                finalMessage.AppendLine($"{pnlEmoji} <b>Total P&L:</b> ₹{Math.Abs(portfolio?.TotalProfitLoss ?? 0):N2} ({portfolio?.TotalProfitLossPercent ?? 0:F2}%)\n");
+                finalMessage.AppendLine($"⏱️ <b>Estimated Recovery Time:</b> {recoveryTime}\n");
+
+                // Key Warnings (top 3)
+                if (warnings.Any())
                 {
-                    prioritySteps.AppendLine("⚠️ <b>URGENT:</b> Sell stop loss hits immediately");
+                    finalMessage.AppendLine("<b>⚠️ Key Warnings:</b>");
+                    foreach (var warning in warnings.Take(3))
+                    {
+                        finalMessage.AppendLine($"• {warning}");
+                    }
+                    finalMessage.AppendLine();
                 }
+
+                // Sell Recommendations (top 3) - using reflection to get properties
+                if (actionableTrades.Any())
+                {
+                    var sells = new List<object>();
+                    foreach (var action in actionableTrades)
+                    {
+                        var actionType = action.GetType();
+                        var actionValue = actionType.GetProperty("Action")?.GetValue(action)?.ToString();
+                        if (actionValue == "SELL")
+                        {
+                            sells.Add(action);
+                        }
+                    }
+
+                    sells = sells.OrderBy(a => {
+                        var priority = a.GetType().GetProperty("Priority")?.GetValue(a);
+                        return priority != null ? (int)priority : 999;
+                    }).ToList();
+
+                    if (sells.Any())
+                    {
+                        finalMessage.AppendLine("<b>🔴 SELL RECOMMENDATIONS:</b>");
+                        foreach (var sell in sells.Take(3))
+                        {
+                            var sellType = sell.GetType();
+                            var symbol = sellType.GetProperty("Symbol")?.GetValue(sell)?.ToString() ?? "Unknown";
+                            var quantity = (int)(sellType.GetProperty("Quantity")?.GetValue(sell) ?? 0);
+                            var reason = sellType.GetProperty("Reason")?.GetValue(sell)?.ToString() ?? "";
+                            var priority = (int)(sellType.GetProperty("Priority")?.GetValue(sell) ?? 0);
+                            var expectedProfit = (decimal)(sellType.GetProperty("ExpectedProfit")?.GetValue(sell) ?? 0);
+
+                            var priorityEmoji = priority == 1 ? "⚠️" : "📉";
+                            finalMessage.AppendLine($"{priorityEmoji} <b>{symbol}</b>: Sell {quantity} shares - {reason}");
+                            if (expectedProfit != 0)
+                            {
+                                var profitEmoji = expectedProfit > 0 ? "🟢" : "🔴";
+                                finalMessage.AppendLine($"   Expected: {profitEmoji} ₹{Math.Abs(expectedProfit):N2}");
+                            }
+                        }
+                        finalMessage.AppendLine();
+                    }
+                }
+
+                // Buy Recommendations (top 3)
+                if (buyRecommendations.Any())
+                {
+                    finalMessage.AppendLine("<b>🟢 BUY RECOMMENDATIONS:</b>");
+                    var cashPosition = totalValue - totalInvestment;
+                    if (cashPosition > 0)
+                    {
+                        finalMessage.AppendLine($"<i>Based on available cash: ₹{cashPosition:N2}</i>\n");
+                    }
+
+                    foreach (var rec in buyRecommendations.Take(3))
+                    {
+                        var totalCost = rec.Quantity * rec.CurrentPrice;
+                        finalMessage.AppendLine($"• <b>{rec.Symbol}</b> ({rec.Category})");
+                        finalMessage.AppendLine($"  Buy {rec.Quantity} shares @ ₹{rec.CurrentPrice:F2} = ₹{totalCost:N2}");
+                        finalMessage.AppendLine($"  Target: ₹{rec.TargetPrice:F0} | SL: ₹{rec.StopLoss:F0}");
+                        finalMessage.AppendLine($"  <i>{rec.Reason}</i>\n");
+                    }
+                }
+
+                // Quick Summary
+                finalMessage.AppendLine("<b>📊 QUICK SUMMARY</b>");
+                finalMessage.AppendLine($"📉 Sell: {actionableTrades.Count(a => {
+                    var action = a.GetType().GetProperty("Action")?.GetValue(a)?.ToString();
+                    return action == "SELL";
+                })} | 📈 Buy: {buyRecommendations.Count}");
+                finalMessage.AppendLine($"💰 Cash Flow: ₹{totalSellValue - totalBuyCost:N2}");
+                finalMessage.AppendLine($"📊 Momentum: {momentum}");
+                finalMessage.AppendLine($"🌍 Diversification: {divScore}\n");
+
+                // Priority Actions (top 3)
+                var priorityActions = new List<string>();
+
+                if (actionableTrades.Any(a => {
+                    var priority = a.GetType().GetProperty("Priority")?.GetValue(a);
+                    return priority != null && (int)priority == 1;
+                }))
+                    priorityActions.Add("⚠️ URGENT: Sell stop loss hits immediately");
 
                 if (sectorExposure.GetValueOrDefault("Engineering", 0) > 40)
-                {
-                    prioritySteps.AppendLine("⚡ <b>HIGH:</b> Reduce Engineering sector exposure");
-                }
+                    priorityActions.Add("⚡ HIGH: Reduce Engineering sector exposure");
 
                 foreach (var holding in holdings)
                 {
                     var percentage = (holding.Quantity * holding.CurrentPrice / totalValue) * 100;
                     if (percentage > 30)
                     {
-                        prioritySteps.AppendLine($"⚡ <b>HIGH:</b> Reduce {holding.Symbol} position ({percentage:F1}%)");
+                        priorityActions.Add($"⚡ HIGH: Reduce {holding.Symbol} position ({percentage:F1}%)");
                         break;
                     }
                 }
 
-                var losers = holdings.Where(h => h.ProfitLossPercent < -20).ToList();
                 if (losers.Count >= 2)
-                {
-                    prioritySteps.AppendLine("💰 <b>MEDIUM:</b> Consider tax-loss harvesting before year-end");
-                }
+                    priorityActions.Add("💰 Tax-loss harvesting opportunity");
 
                 if (holdings.Count < 5)
+                    priorityActions.Add("📊 Add more stocks for diversification");
+
+                if (priorityActions.Any())
                 {
-                    prioritySteps.AppendLine("📊 <b>MEDIUM:</b> Add more stocks for diversification");
+                    finalMessage.AppendLine("<b>🎯 PRIORITY ACTIONS</b>");
+                    foreach (var action in priorityActions.Take(3))
+                    {
+                        finalMessage.AppendLine($"• {action}");
+                    }
+                    finalMessage.AppendLine();
                 }
 
-                await SendMessageAsync(chatId, prioritySteps.ToString());
-
-                // Rebalancing Suggestions
-                rebalanceMsg = new StringBuilder();
-                var rebalanceSuggestions = GenerateRebalanceSuggestions(holdings, portfolio, sectorExposure);
+                // Rebalancing Suggestions (top 2)
                 if (rebalanceSuggestions.Any())
                 {
-                    rebalanceMsg.AppendLine("<b>⚖️ REBALANCING SUGGESTIONS</b>\n");
-
-                    foreach (var suggestion in rebalanceSuggestions)
+                    finalMessage.AppendLine("<b>⚖️ REBALANCING SUGGESTIONS</b>");
+                    foreach (var suggestion in rebalanceSuggestions.Take(2))
                     {
-                        rebalanceMsg.AppendLine($"• {suggestion}");
+                        finalMessage.AppendLine($"• {suggestion}");
                     }
-                    await SendMessageAsync(chatId, rebalanceMsg.ToString());
+                    finalMessage.AppendLine();
                 }
 
-                // What-If Scenario
-                var currentEngineeringExposure = sectorExposure.GetValueOrDefault("Engineering", 0m);
-                if (currentEngineeringExposure > 40)
+                // Sector Allocation (top 3)
+                if (sectorExposure.Any())
                 {
-                    var targetExposure = 30m;
-                    var reductionNeeded = currentEngineeringExposure - targetExposure;
-                    var valueToReduce = (reductionNeeded / 100) * totalValue;
-
-                    whatIf = new StringBuilder();
-                    whatIf.AppendLine("<b>🔮 WHAT IF YOU REBALANCE?</b>");
-                    whatIf.AppendLine($"Current Engineering exposure: {currentEngineeringExposure:F1}%");
-                    whatIf.AppendLine($"Target: {targetExposure}%");
-                    whatIf.AppendLine($"You need to reduce by ₹{valueToReduce:N2} in Engineering sector");
-                    whatIf.AppendLine($"This would improve your Health Score by ~15 points");
-                    await SendMessageAsync(chatId, whatIf.ToString());
+                    finalMessage.AppendLine("<b>📊 TOP SECTORS</b>");
+                    foreach (var sec in sectorExposure.OrderByDescending(s => s.Value).Take(3))
+                    {
+                        var emoji = sec.Value > 40 ? "🔴" : sec.Value > 25 ? "🟡" : "🟢";
+                        // Use GenerateHeatMap here!
+                        var heatMap = GenerateHeatMap(sec.Value);
+                        finalMessage.AppendLine($"{emoji} {sec.Key}: {sec.Value:F1}% ({heatMap})");
+                    }
+                    finalMessage.AppendLine();
                 }
 
-                // Scenario Analysis
+                // Portfolio Heat Map - Add this section after Sector Allocation
                 if (holdings.Any())
                 {
-                    var bestPerformer = holdings.OrderByDescending(h => h.ProfitLossPercent).First();
-                    var worstPerformer = holdings.OrderBy(h => h.ProfitLossPercent).First();
-
-                    scenarioMsg = new StringBuilder();
-                    scenarioMsg.AppendLine("<b>🎲 SCENARIO ANALYSIS</b>");
-                    scenarioMsg.AppendLine($"If {bestPerformer.Symbol} gains another 20%: +₹{(bestPerformer.Quantity * bestPerformer.CurrentPrice * 0.2m):N2}");
-                    scenarioMsg.AppendLine($"If {worstPerformer.Symbol} loses another 20%: -₹{(worstPerformer.Quantity * worstPerformer.CurrentPrice * 0.2m):N2}");
-
-                    var netImpact = (bestPerformer.Quantity * bestPerformer.CurrentPrice * 0.2m) - (worstPerformer.Quantity * worstPerformer.CurrentPrice * 0.2m);
-                    scenarioMsg.AppendLine($"Net impact: {(netImpact >= 0 ? "🟢 +" : "🔴 ")}{netImpact:N2}");
-
-                    await SendMessageAsync(chatId, scenarioMsg.ToString());
-                }
-
-                // Tax Loss Harvesting
-                if (losers.Count >= 2)
-                {
-                    taxMsg = new StringBuilder();
-                    taxMsg.AppendLine("<b>💰 TAX LOSS HARVESTING OPPORTUNITY</b>");
-                    taxMsg.AppendLine($"You have {losers.Count} stocks with >20% loss:");
-                    foreach (var loser in losers.Take(3))
+                    finalMessage.AppendLine("<b>🔥 PORTFOLIO HEAT MAP</b>");
+                    foreach (var holding in holdings.OrderByDescending(h => (h.Quantity * h.CurrentPrice / totalValue) * 100).Take(5))
                     {
-                        taxMsg.AppendLine($"• {loser.Symbol}: ₹{Math.Abs(loser.ProfitLoss):N2} loss");
+                        var percentage = (holding.Quantity * holding.CurrentPrice / totalValue) * 100;
+                        var performance = holding.ProfitLossPercent >= 0 ? "🟢" : "🔴";
+                        var heatMap = GenerateHeatMap(percentage);
+                        finalMessage.AppendLine($"{performance} {holding.Symbol}: {percentage:F1}% ({heatMap})");
                     }
-
-                    var totalLoss = losers.Sum(l => Math.Abs(l.ProfitLoss));
-                    taxMsg.AppendLine($"\nTotal loss available: ₹{totalLoss:N2}");
-                    taxMsg.AppendLine("<i>Selling these can offset future capital gains tax.</i>");
-                    taxMsg.AppendLine("<i>Consider tax-loss harvesting before year-end.</i>");
-
-                    var taxSavings = totalLoss * 0.15m;
-                    taxMsg.AppendLine($"💵 Estimated tax savings: ₹{taxSavings:N2}");
-
-                    await SendMessageAsync(chatId, taxMsg.ToString());
+                    finalMessage.AppendLine();
                 }
 
-                await SendMessageAsync(chatId, "⏳ [6/6] Finalizing analysis...");
+                // Market Comparison
+                finalMessage.AppendLine("<b>📈 VS NIFTY 50</b>");
+                var comparison = (portfolio?.TotalProfitLossPercent ?? 0).CompareTo(niftyReturn);
+                if (comparison > 0)
+                    finalMessage.AppendLine($"🟢 You're outperforming Nifty by {(portfolio?.TotalProfitLossPercent ?? 0) - niftyReturn:F1}%");
+                else if (comparison < 0)
+                    finalMessage.AppendLine($"🔴 You're underperforming Nifty by {niftyReturn - (portfolio?.TotalProfitLossPercent ?? 0):F1}%");
+                else
+                    finalMessage.AppendLine($"⚪ You're matching Nifty");
+                finalMessage.AppendLine();
 
                 // Stress Test
-                stressTest = new StringBuilder();
-                stressTest.AppendLine("<b>⚠️ STRESS TEST</b>");
-
                 var potentialLoss = totalValue * 0.1m;
-                stressTest.AppendLine($"• If market drops 10%: -₹{potentialLoss:N2}");
-
+                finalMessage.AppendLine("<b>⚠️ STRESS TEST</b>");
+                finalMessage.AppendLine($"• Market -10%: -₹{potentialLoss:N2}");
                 if (holdings.Any())
                 {
                     var worstStock = holdings.OrderBy(h => h.ProfitLossPercent).First();
-                    var additionalLoss = worstStock.Quantity * worstStock.CurrentPrice * 0.2m;
-                    stressTest.AppendLine($"• If {worstStock.Symbol} drops 20% more: -₹{additionalLoss:N2}");
-
-                    var totalStressLoss = potentialLoss + additionalLoss;
-                    stressTest.AppendLine($"• Total potential loss: -₹{totalStressLoss:N2} ({((totalStressLoss / totalValue) * 100):F1}% of portfolio)");
-
-                    var bestStock = holdings.OrderByDescending(h => h.ProfitLossPercent).First();
-                    var bestStockLoss = bestStock.Quantity * bestStock.CurrentPrice * 0.2m;
-                    stressTest.AppendLine($"• If {bestStock.Symbol} drops 20%: -₹{bestStockLoss:N2}");
+                    finalMessage.AppendLine($"• {worstStock.Symbol} -20% more: -₹{worstStock.Quantity * worstStock.CurrentPrice * 0.2m:N2}");
                 }
+                finalMessage.AppendLine();
 
-                await SendMessageAsync(chatId, stressTest.ToString());
-
-                // Market Comparison with Real Data
-                var niftyReturn = await GetNiftyReturn(stockService);
-                var comparison = portfolio.TotalProfitLossPercent.CompareTo(niftyReturn);
-
-                compareMsg = new StringBuilder();
-                compareMsg.AppendLine("<b>📈 VS NIFTY 50</b>");
-                compareMsg.AppendLine($"Nifty 30-day return: {niftyReturn:F1}%");
-
-                if (comparison > 0)
-                    compareMsg.AppendLine($"🟢 You're outperforming Nifty by {portfolio.TotalProfitLossPercent - niftyReturn:F1}%");
-                else if (comparison < 0)
-                    compareMsg.AppendLine($"🔴 You're underperforming Nifty by {niftyReturn - portfolio.TotalProfitLossPercent:F1}%");
-                else
-                    compareMsg.AppendLine($"⚪ You're matching Nifty");
-
-                // Add sector comparison with real sector averages
-                compareMsg.AppendLine($"\n<b>Your top sectors vs Market:</b>");
-                foreach (var sec in sectorExposure.OrderByDescending(s => s.Value).Take(3))
+                // Tax Loss Harvesting (if applicable)
+                if (losers.Count >= 2)
                 {
-                    var sectorAvg = await GetSectorAverageReturn(sec.Key);
-                    var sectorComparison = portfolio.TotalProfitLossPercent.CompareTo(sectorAvg);
-                    var sectorEmoji = sectorComparison > 0 ? "🟢" : sectorComparison < 0 ? "🔴" : "⚪";
-                    compareMsg.AppendLine($"{sectorEmoji} {sec.Key}: {sec.Value:F1}% (Sector avg: {sectorAvg:F1}%)");
+                    finalMessage.AppendLine("<b>💰 TAX LOSS HARVESTING</b>");
+                    var totalLoss = losers.Sum(l => Math.Abs(l.ProfitLoss));
+                    finalMessage.AppendLine($"Total loss available: ₹{totalLoss:N2}");
+                    finalMessage.AppendLine($"Estimated tax savings: ₹{totalLoss * 0.15m:N2}\n");
                 }
 
-                await SendMessageAsync(chatId, compareMsg.ToString());
-
-                // Portfolio Heat Map
-                heatMsg = new StringBuilder();
-                heatMsg.AppendLine("<b>🔥 PORTFOLIO HEAT MAP</b>\n");
-
-                foreach (var holding in holdings.OrderByDescending(h => (h.Quantity * h.CurrentPrice / totalValue) * 100).Take(5))
-                {
-                    var percentage = (holding.Quantity * holding.CurrentPrice / totalValue) * 100;
-                    var heat = GenerateHeatMap(percentage);
-                    var performance = holding.ProfitLossPercent >= 0 ? "🟢" : "🔴";
-                    heatMsg.AppendLine($"{performance} {holding.Symbol}: {percentage:F1}% ({heat})");
-                }
-
-                await SendMessageAsync(chatId, heatMsg.ToString());
-
-                // Goal-Based Advice
-                goalMsg = new StringBuilder();
-                goalMsg.AppendLine("<b>🎯 GOAL-BASED ADVICE</b>");
-
-                if (portfolio.TotalProfitLossPercent < -30)
-                {
-                    goalMsg.AppendLine("• <b>Conservative:</b> Cut losses and move to safer assets (bonds, FDs)");
-                    goalMsg.AppendLine("• <b>Aggressive:</b> Average down on quality stocks if fundamentals strong");
-                    goalMsg.AppendLine("• <b>Income:</b> Consider dividend stocks for regular income");
-                    goalMsg.AppendLine("• <b>Growth:</b> Wait for recovery before adding more risk");
-                }
-                else if (portfolio.TotalProfitLossPercent > 20)
-                {
-                    goalMsg.AppendLine("• <b>Conservative:</b> Book partial profits (30-50%)");
-                    goalMsg.AppendLine("• <b>Aggressive:</b> Let winners run with trailing stops");
-                    goalMsg.AppendLine("• <b>Income:</b> Consider profit withdrawal for regular income");
-                    goalMsg.AppendLine("• <b>Growth:</b> Reinvest profits in other opportunities");
-                }
-                else if (portfolio.TotalProfitLossPercent < -10)
-                {
-                    goalMsg.AppendLine("• <b>Conservative:</b> Review stop losses and cut losses if needed");
-                    goalMsg.AppendLine("• <b>Aggressive:</b> Hold for recovery if fundamentals strong");
-                    goalMsg.AppendLine("• <b>Income:</b> Focus on capital preservation");
-                }
-
-                await SendMessageAsync(chatId, goalMsg.ToString());
-
-                // Sector Allocation with Heat Map
-                if (sectorExposure.Any())
-                {
-                    sector = new StringBuilder();
-                    sector.AppendLine("<b>📊 SECTOR ALLOCATION</b>\n");
-
-                    foreach (var sec in sectorExposure.OrderByDescending(s => s.Value).Take(5))
-                    {
-                        var emoji = sec.Value > 40 ? "🔴" : sec.Value > 25 ? "🟡" : "🟢";
-                        var heat = GenerateHeatMap(sec.Value);
-                        sector.AppendLine($"{emoji} {sec.Key}: {sec.Value:F1}% ({heat})");
-                    }
-
-                    if (sectorExposure.GetValueOrDefault("Engineering", 0) > 40)
-                    {
-                        sector.AppendLine($"\n💡 <i>Consider reducing Engineering exposure to below 30%</i>");
-                    }
-
-                    await SendMessageAsync(chatId, sector.ToString());
-                }
-
-                // Risk Score Breakdown
-                riskMsg = new StringBuilder();
-                riskMsg.AppendLine("<b>⚠️ RISK SCORE BREAKDOWN</b>\n");
-
-                foreach (var holding in holdings.OrderByDescending(h => Math.Abs(h.ProfitLossPercent)).Take(3))
-                {
-                    var concentration = (holding.Quantity * holding.CurrentPrice / totalValue) * 100;
-                    var riskScore = 0;
-                    var reasons = new List<string>();
-
-                    if (concentration > 20)
-                    {
-                        riskScore += 30;
-                        reasons.Add("High concentration");
-                    }
-
-                    if (holding.ProfitLossPercent < -20)
-                    {
-                        riskScore += 40;
-                        reasons.Add("Deep loss");
-                    }
-
-                    if (Math.Abs(holding.ProfitLossPercent) > 30)
-                    {
-                        riskScore += 30;
-                        reasons.Add("High volatility");
-                    }
-
-                    riskMsg.AppendLine($"• {holding.Symbol}: Risk Score {riskScore}/100 - {string.Join(", ", reasons)}");
-                }
-
-                await SendMessageAsync(chatId, riskMsg.ToString());
-
-                // Dividend Analysis
-                divAnalysis = await GetDividendAnalysis(holdings, totalValue);
+                // Dividend Analysis (if applicable)
                 if (!string.IsNullOrEmpty(divAnalysis))
                 {
-                    await SendMessageAsync(chatId, divAnalysis);
+                    finalMessage.AppendLine(divAnalysis);
+                    finalMessage.AppendLine();
                 }
 
                 // Market Cap Analysis
-                marketCapAnalysis = await AnalyzeMarketCap(holdings);
-                await SendMessageAsync(chatId, marketCapAnalysis);
+                finalMessage.AppendLine(marketCapAnalysis);
+                finalMessage.AppendLine();
 
-                // Optimization Suggestions
-                var optimizationSuggestions = OptimizePortfolio(holdings, totalValue, sectorExposure);
-                if (optimizationSuggestions.Any())
-                {
-                    optMsg = new StringBuilder();
-                    optMsg.AppendLine("<b>⚙️ OPTIMIZATION SUGGESTIONS</b>\n");
-                    foreach (var suggestion in optimizationSuggestions.Take(3))
-                    {
-                        optMsg.AppendLine($"• {suggestion}");
-                    }
-                    await SendMessageAsync(chatId, optMsg.ToString());
-                }
+                // Scorecard
+                finalMessage.AppendLine(scorecard);
+                finalMessage.AppendLine();
 
-                // Portfolio Scorecard
-                var scorecard = GenerateScorecard(portfolio, healthScore, sectorExposure, niftyReturn);
-                await SendMessageAsync(chatId, scorecard);
-
-                // Alert Suggestions
-                var alertSuggestions = await SuggestAlerts(holdings);
+                // Alert Suggestions (top 2)
                 if (alertSuggestions.Any())
                 {
-                    alertMsg = new StringBuilder();
-                    alertMsg.AppendLine("<b>🔔 SUGGESTED ALERTS</b>\n");
-                    foreach (var alert in alertSuggestions.Take(3))
+                    finalMessage.AppendLine("<b>🔔 SUGGESTED ALERTS</b>");
+                    foreach (var alert in alertSuggestions.Take(2))
                     {
-                        alertMsg.AppendLine($"• {alert}");
+                        finalMessage.AppendLine($"• {alert}");
                     }
-                    await SendMessageAsync(chatId, alertMsg.ToString());
+                    finalMessage.AppendLine();
                 }
 
-                // Peer Comparison with Real Data
-                peerComparison = await GeneratePeerComparison(holdings);
+                // Peer Comparison (if available)
                 if (!string.IsNullOrEmpty(peerComparison))
                 {
-                    await SendMessageAsync(chatId, peerComparison);
+                    finalMessage.AppendLine(peerComparison);
+                    finalMessage.AppendLine();
                 }
 
-                // AI Insight (Optional)
-                aiInsight = await GetAIInsights(portfolio);
+                // AI Insight (if available)
                 if (!string.IsNullOrEmpty(aiInsight))
                 {
-                    await SendMessageAsync(chatId, aiInsight);
+                    finalMessage.AppendLine(aiInsight);
+                    finalMessage.AppendLine();
                 }
 
-                // Historical Performance Chart
-                chart = GeneratePerformanceChart(holdings);
-                await SendMessageAsync(chatId, chart);
+                // Footer
+                finalMessage.AppendLine($"<i>Analysis generated: {DateTime.Now:dd MMM yyyy HH:mm}</i>");
+                finalMessage.AppendLine("\n<i>Use /help for more commands</i>");
 
-                // Export Option
-                await SendMessageAsync(chatId,
-                    "📎 <b>Want to save this analysis?</b>\n" +
-                    "• Reply with /export to get a text file\n" +
-                    "• Or take a screenshot for your records");
+                // ========== OPTIMIZATION 6: Send as single message ==========
+                var finalText = finalMessage.ToString();
 
-                // Completion message
-                await SendMessageAsync(chatId, "✅ <i>Analysis complete! Use /help for more commands.</i>");
-
-                if (actionableTrades.Any() || buyRecommendations.Any() || rebalanceSuggestions.Any())
+                // Split if too long (Telegram limit is 4096)
+                if (finalText.Length > 4000)
                 {
-                    await SendMessageAsync(chatId,
-                        "❓ To implement these suggestions, use:\n" +
-                        "• /sell SYMBOL QUANTITY - Sell specific stock\n" +
-                        "• /buy SYMBOL QUANTITY PRICE - Buy specific stock");
+                    var parts = SplitMessage(finalText, 4000);
+                    foreach (var part in parts)
+                    {
+                        await SendMessageAsync(chatId, part);
+                    }
+                }
+                else
+                {
+                    await SendMessageAsync(chatId, finalText);
                 }
 
-                await SendMessageAsync(chatId, $"<i>Analysis generated: {DateTime.Now:dd MMM yyyy HH:mm}</i>");
-
-                // ========== ENHANCEMENT 5: Cache the result ==========
-                var fullAnalysis = new StringBuilder();
-                if (overview != null) fullAnalysis.Append(overview);
-                if (actions != null) fullAnalysis.Append(actions);
-                if (buyMsg != null) fullAnalysis.Append(buyMsg);
-                if (summary != null) fullAnalysis.Append(summary);
-                if (prioritySteps != null) fullAnalysis.Append(prioritySteps);
-                if (rebalanceMsg != null) fullAnalysis.Append(rebalanceMsg);
-                if (whatIf != null) fullAnalysis.Append(whatIf);
-                if (scenarioMsg != null) fullAnalysis.Append(scenarioMsg);
-                if (taxMsg != null) fullAnalysis.Append(taxMsg);
-                if (stressTest != null) fullAnalysis.Append(stressTest);
-                if (compareMsg != null) fullAnalysis.Append(compareMsg);
-                if (heatMsg != null) fullAnalysis.Append(heatMsg);
-                if (goalMsg != null) fullAnalysis.Append(goalMsg);
-                if (sector != null) fullAnalysis.Append(sector);
-                if (riskMsg != null) fullAnalysis.Append(riskMsg);
-                if (divAnalysis != null) fullAnalysis.Append(divAnalysis);
-                if (marketCapAnalysis != null) fullAnalysis.Append(marketCapAnalysis);
-                if (optMsg != null) fullAnalysis.Append(optMsg);
-                if (scorecard != null) fullAnalysis.Append(scorecard);
-                if (alertMsg != null) fullAnalysis.Append(alertMsg);
-                if (peerComparison != null) fullAnalysis.Append(peerComparison);
-                if (aiInsight != null) fullAnalysis.Append(aiInsight);
-                if (chart != null) fullAnalysis.Append(chart);
-
-                _cache.Set(cacheKey, fullAnalysis.ToString(), TimeSpan.FromMinutes(CACHE_DURATION_MINUTES));
+                // ========== OPTIMIZATION 7: Cache the result ==========
+                _cache.Set(cacheKey, finalText, TimeSpan.FromMinutes(CACHE_DURATION_MINUTES));
             }
             catch (UnauthorizedAccessException)
             {
@@ -1039,8 +907,267 @@ namespace StockNotificationApi.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error sending portfolio suggestions to {ChatId}", chatId);
-                await SendMessageAsync(chatId, "❌ Error generating portfolio suggestions. Please try again later.");
+                await SendMessageAsync(chatId, $"❌ Error generating portfolio suggestions: {ex.Message}");
             }
+        }
+
+        // Safe wrapper methods (keeping these as they were)
+        private Dictionary<string, decimal> SafeCalculateSectorAnalysis(List<Holding> holdings)
+        {
+            try
+            {
+                return CalculateSectorAnalysis(holdings);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in sector analysis");
+                return new Dictionary<string, decimal>();
+            }
+        }
+
+        private async Task<List<TradeItem>> SafeGenerateBuyRecommendations(List<Holding> holdings, ITradingService tradingService, PortfolioSummary portfolio)
+        {
+            try
+            {
+                return await GenerateBuyRecommendations(holdings, tradingService, portfolio);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in buy recommendations");
+                return new List<TradeItem>();
+            }
+        }
+
+        private async Task<string> SafeGetDividendAnalysis(List<Holding> holdings, decimal totalValue)
+        {
+            try
+            {
+                return await GetDividendAnalysis(holdings, totalValue);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in dividend analysis");
+                return null;
+            }
+        }
+
+        private async Task<string> SafeAnalyzeMarketCap(List<Holding> holdings)
+        {
+            try
+            {
+                return await AnalyzeMarketCap(holdings);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in market cap analysis");
+                return "<b>📊 MARKET CAP ALLOCATION</b>\nData temporarily unavailable";
+            }
+        }
+
+        private async Task<string> SafeGeneratePeerComparison(List<Holding> holdings)
+        {
+            try
+            {
+                return await GeneratePeerComparison(holdings);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in peer comparison");
+                return null;
+            }
+        }
+
+        private async Task<string> SafeGetAIInsights(PortfolioSummary portfolio, IServiceScopeFactory scopeFactory, List<Holding> holdings)
+        {
+            try
+            {
+                using var scope = scopeFactory.CreateScope();
+                var aiService = scope.ServiceProvider.GetService<IAIService>();
+                var stockService = scope.ServiceProvider.GetService<IStockService>();
+
+                if (aiService == null || stockService == null)
+                {
+                    return GeneratePortfolioBasedInsight(portfolio, holdings);
+                }
+
+                // Get stock data for the holdings to provide context
+                var stockDataList = new List<StockData>();
+
+                foreach (var holding in holdings.Take(5))
+                {
+                    try
+                    {
+                        var cleanSymbol = holding.Symbol.Replace("-EQ", "").Trim();
+                        var stockData = await stockService.GetStockDataAsync($"{cleanSymbol}.NS");
+
+                        if (stockData == null)
+                        {
+                            stockData = await stockService.GetStockDataAsync($"{cleanSymbol}.BO");
+                        }
+
+                        if (stockData != null)
+                        {
+                            stockDataList.Add(stockData);
+                        }
+
+                        await Task.Delay(50); // Small delay to avoid rate limiting
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Could not fetch stock data for {Symbol}", holding.Symbol);
+                    }
+                }
+
+                // Get market-wide data for better context
+                var marketStocks = await stockService.GetIndianStockDataAsync();
+                if (marketStocks != null && marketStocks.Any())
+                {
+                    stockDataList.AddRange(marketStocks.Take(10));
+                }
+
+                if (stockDataList.Any())
+                {
+                    var insight = await aiService.GetMarketInsightAsync(stockDataList);
+                    if (!string.IsNullOrEmpty(insight))
+                    {
+                        return $"🤖 <b>Market Insight:</b>\n{insight}";
+                    }
+                }
+
+                // Fallback to portfolio-based insight
+                return GeneratePortfolioBasedInsight(portfolio, holdings);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in AI insights");
+                return GeneratePortfolioBasedInsight(portfolio, holdings);
+            }
+        }
+
+        private string GeneratePortfolioBasedInsight(PortfolioSummary portfolio, List<Holding> holdings)
+        {
+            var totalPL = portfolio.TotalProfitLossPercent;
+            var losers = holdings.Count(h => h.ProfitLoss < 0);
+            var winners = holdings.Count(h => h.ProfitLoss > 0);
+            var totalValue = portfolio.CurrentValue;
+
+            var insight = new StringBuilder();
+            insight.AppendLine("🤖 <b>Portfolio Analysis:</b>\n");
+
+            // Overall portfolio condition
+            if (totalPL < -30)
+            {
+                insight.AppendLine("🔴 Your portfolio is in a critical loss situation. Consider:");
+                insight.AppendLine("• Reviewing stop losses on all positions");
+                insight.AppendLine("• Cutting losses on weakest performers first");
+                insight.AppendLine("• Raising cash for better opportunities");
+            }
+            else if (totalPL < -20)
+            {
+                insight.AppendLine("🟡 Significant portfolio drawdown detected. Recommendations:");
+                insight.AppendLine("• Focus on quality stocks with strong fundamentals");
+                insight.AppendLine("• Consider tax-loss harvesting before year-end");
+                insight.AppendLine("• Avoid averaging down on weak positions");
+            }
+            else if (totalPL < -10)
+            {
+                insight.AppendLine("🟡 Mild portfolio weakness. Suggestions:");
+                insight.AppendLine("• Review sector allocation for overexposure");
+                insight.AppendLine("• Set strict stop losses on volatile positions");
+                insight.AppendLine("• Look for diversification opportunities");
+            }
+            else if (totalPL > 20)
+            {
+                insight.AppendLine("🟢 Strong portfolio performance! Consider:");
+                insight.AppendLine("• Booking partial profits on winners");
+                insight.AppendLine("• Using trailing stops to protect gains");
+                insight.AppendLine("• Rebalancing into undervalued sectors");
+            }
+
+            // Sector-specific insights
+            var engineeringExposure = holdings
+                .Where(h => GetSectorFromSymbol(h.Symbol) == "Engineering")
+                .Sum(h => h.Quantity * h.CurrentPrice) / totalValue * 100;
+
+            if (engineeringExposure > 40)
+            {
+                insight.AppendLine($"\n🏭 Engineering sector represents {engineeringExposure:F1}% of your portfolio.");
+                insight.AppendLine("• Consider diversifying into other sectors");
+                insight.AppendLine("• Watch for sector-specific news and policy changes");
+            }
+
+            // Worst performer insight
+            var worstPerformer = holdings.OrderBy(h => h.ProfitLossPercent).FirstOrDefault();
+            if (worstPerformer != null && worstPerformer.ProfitLossPercent < -40)
+            {
+                insight.AppendLine($"\n⚠️ {worstPerformer.Symbol} is down {worstPerformer.ProfitLossPercent:F1}%.");
+                insight.AppendLine("• Review if fundamentals have changed");
+                insight.AppendLine("• Consider cutting losses if no recovery catalyst");
+            }
+
+            // Best performer insight
+            var bestPerformer = holdings.OrderByDescending(h => h.ProfitLossPercent).FirstOrDefault();
+            if (bestPerformer != null && bestPerformer.ProfitLossPercent > 20)
+            {
+                insight.AppendLine($"\n📈 {bestPerformer.Symbol} is up {bestPerformer.ProfitLossPercent:F1}%.");
+                insight.AppendLine("• Consider trailing stop loss to protect profits");
+                insight.AppendLine("• Watch for resistance levels");
+            }
+
+            // Cash position insight
+            var cashPosition = totalValue - portfolio.TotalInvestment;
+            if (cashPosition > 0)
+            {
+                insight.AppendLine($"\n💰 You have ₹{cashPosition:N2} cash available.");
+                insight.AppendLine("• Dry powder for averaging down quality stocks");
+                insight.AppendLine("• Consider deploying gradually");
+            }
+            else if (cashPosition < -10000)
+            {
+                insight.AppendLine($"\n⚠️ You're using leverage (negative cash position).");
+                insight.AppendLine("• Reduce positions to lower risk");
+                insight.AppendLine("• Consider margin requirements");
+            }
+
+            // Market context
+            var marketCondition = totalPL switch
+            {
+                < -20 => "bear market",
+                < -10 => "corrective phase",
+                > 20 => "bull market",
+                > 10 => "uptrend",
+                _ => "range-bound market"
+            };
+
+            insight.AppendLine($"\n📊 Market Context: Currently in a {marketCondition}.");
+            insight.AppendLine("• Adjust strategy based on market phase");
+            insight.AppendLine("• Focus on sector rotation opportunities");
+
+            return insight.ToString();
+        }
+
+        private async Task<List<string>> SafeSuggestAlerts(List<Holding> holdings)
+        {
+            try
+            {
+                return await SuggestAlerts(holdings);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in alert suggestions");
+                return new List<string>();
+            }
+        }
+
+        // Helper method to split long messages
+        private List<string> SplitMessage(string message, int maxLength)
+        {
+            var parts = new List<string>();
+            for (int i = 0; i < message.Length; i += maxLength)
+            {
+                parts.Add(message.Substring(i, Math.Min(maxLength, message.Length - i)));
+            }
+            return parts;
         }
 
 

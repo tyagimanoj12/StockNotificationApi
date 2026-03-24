@@ -1,9 +1,10 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using Twilio;
+using Twilio.Exceptions;
 using Twilio.Rest.Api.V2010.Account;
 using Twilio.Types;
-using Twilio.Exceptions;
 
 namespace StockNotificationApi.Services
 {
@@ -13,10 +14,10 @@ namespace StockNotificationApi.Services
         private readonly ILogger<TwilioSmsService> _logger;
         private readonly bool _isInitialized;
 
-        // Constants
-        private const int MAX_MESSAGE_LENGTH = 160;
-        private const int SMS_SEND_DELAY_MS = 100;
-        private const int MAX_RETRY_ATTEMPTS = 3;
+        // Use constants from Constants.cs
+        private const int MAX_MESSAGE_LENGTH = SmsConstants.MAX_MESSAGE_LENGTH;
+        private const int SMS_SEND_DELAY_MS = RateLimitConstants.SMS_SEND_DELAY_MS;
+        private const int MAX_RETRY_ATTEMPTS = TimeoutConstants.MAX_RETRY_ATTEMPTS;
 
         public TwilioSmsService(IConfiguration configuration, ILogger<TwilioSmsService> logger)
         {

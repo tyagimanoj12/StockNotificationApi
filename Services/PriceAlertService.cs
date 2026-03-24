@@ -1,5 +1,6 @@
 ﻿using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
+using System.Collections.Concurrent;
 
 namespace StockNotificationApi.Services
 {
@@ -7,18 +8,31 @@ namespace StockNotificationApi.Services
     {
         private readonly IServiceProvider _services;
         private readonly ILogger<PriceAlertService> _logger;
+        private readonly ICacheService _cacheService;
+        private static readonly SemaphoreSlim _alertCheckLock = new(1, 1);
+
+        // Use constants from Constants.cs
+        private const int CHECK_INTERVAL_SECONDS = 30;
+        private const int ERROR_RETRY_SECONDS = 60;
+        private const int PRICE_CACHE_DURATION_SECONDS = 60; // Cache prices for 1 minute
 
         // In-memory alerts storage
         private static readonly Dictionary<long, List<UserAlert>> _userAlerts = new();
         private static readonly object _alertLock = new();
         private static int _nextId = 1;
 
+        // Track last alert check to avoid concurrent checks
+        private static DateTime _lastCheckTime = DateTime.MinValue;
+        private static bool _isChecking = false;
+
         public PriceAlertService(
             IServiceProvider services,
-            ILogger<PriceAlertService> logger)
+            ILogger<PriceAlertService> logger,
+            ICacheService cacheService)
         {
             _services = services ?? throw new ArgumentNullException(nameof(services));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _cacheService = cacheService ?? throw new ArgumentNullException(nameof(cacheService));
         }
 
         public class UserAlert
@@ -62,7 +76,7 @@ namespace StockNotificationApi.Services
 
                 _userAlerts[chatId].Add(new UserAlert
                 {
-                    Id = _nextId++,
+                    Id = Interlocked.Increment(ref _nextId),
                     Symbol = symbol.ToUpper(),
                     TargetPrice = targetPrice,
                     IsAbove = isAbove,
@@ -121,6 +135,7 @@ namespace StockNotificationApi.Services
             return Task.CompletedTask;
         }
 
+        // FIX: Add the missing method
         public Task<int> GetActiveAlertCountAsync(long chatId)
         {
             lock (_alertLock)
@@ -141,16 +156,24 @@ namespace StockNotificationApi.Services
                 try
                 {
                     await CheckAlerts(stoppingToken);
-                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                    await Task.Delay(TimeSpan.FromSeconds(CHECK_INTERVAL_SECONDS), stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
+                    _logger.LogInformation("Price Alert Service stopping gracefully");
                     break;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error in price alert service");
-                    await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(ERROR_RETRY_SECONDS), stoppingToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -159,99 +182,188 @@ namespace StockNotificationApi.Services
 
         private async Task CheckAlerts(CancellationToken stoppingToken)
         {
-            List<(long chatId, UserAlert alert)> alertsToCheck;
-
-            // Get snapshot of alerts to check
-            lock (_alertLock)
+            // Prevent concurrent alert checks
+            if (_isChecking)
             {
-                alertsToCheck = _userAlerts
-                    .SelectMany(kvp => kvp.Value
-                        .Where(a => !a.IsTriggered)
-                        .Select(a => (kvp.Key, a)))
-                    .ToList();
-            }
-
-            if (!alertsToCheck.Any())
+                _logger.LogDebug("Alert check already in progress, skipping...");
                 return;
-
-            using var scope = _services.CreateScope();
-            var stockService = scope.ServiceProvider.GetRequiredService<IStockService>();
-            var telegram = scope.ServiceProvider.GetRequiredService<ITelegramBotService>();
-
-            // Group by symbol to batch API calls
-            var symbols = alertsToCheck.Select(a => a.alert.Symbol).Distinct().ToList();
-            var stockData = new Dictionary<string, StockData?>();
-
-            foreach (var symbol in symbols)
-            {
-                try
-                {
-                    // Try NSE first, then BSE
-                    var stock = await stockService.GetStockDataAsync($"{symbol}.NS");
-                    if (stock == null)
-                        stock = await stockService.GetStockDataAsync($"{symbol}.BO");
-
-                    stockData[symbol] = stock;
-
-                    // Small delay to avoid rate limiting
-                    await Task.Delay(100, stoppingToken);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error fetching price for {Symbol}", symbol);
-                    stockData[symbol] = null;
-                }
             }
 
-            var triggeredAlerts = new List<(long chatId, UserAlert alert, decimal price)>();
-
-            lock (_alertLock)
+            await _alertCheckLock.WaitAsync(stoppingToken);
+            try
             {
-                foreach (var (chatId, alert) in alertsToCheck)
+                _isChecking = true;
+                _lastCheckTime = DateTime.UtcNow;
+
+                List<(long chatId, UserAlert alert)> alertsToCheck;
+
+                // Get snapshot of alerts to check
+                lock (_alertLock)
                 {
-                    if (!stockData.TryGetValue(alert.Symbol, out var stock) || stock == null)
+                    alertsToCheck = _userAlerts
+                        .SelectMany(kvp => kvp.Value
+                            .Where(a => !a.IsTriggered)
+                            .Select(a => (kvp.Key, a)))
+                        .ToList();
+                }
+
+                if (!alertsToCheck.Any())
+                    return;
+
+                _logger.LogDebug("Checking {Count} alerts for {Symbols} unique symbols",
+                    alertsToCheck.Count, alertsToCheck.Select(a => a.alert.Symbol).Distinct().Count());
+
+                using var scope = _services.CreateScope();
+                var angelOneService = scope.ServiceProvider.GetRequiredService<IAngelOneService>();
+                var telegram = scope.ServiceProvider.GetRequiredService<ITelegramBotService>();
+
+                // Group by symbol to batch API calls
+                var symbols = alertsToCheck.Select(a => a.alert.Symbol).Distinct().ToList();
+                var stockData = new Dictionary<string, StockData?>();
+
+                // First, try to get from cache
+                var symbolsToFetch = new List<string>();
+
+                foreach (var symbol in symbols)
+                {
+                    var cached = _cacheService.Get<StockData>($"alert_price_{symbol}");
+                    if (cached != null && DateTime.UtcNow - cached.Timestamp < TimeSpan.FromSeconds(PRICE_CACHE_DURATION_SECONDS))
                     {
-                        _logger.LogDebug("No stock data available for {Symbol}, skipping alert check", alert.Symbol);
-                        continue;
+                        stockData[symbol] = cached;
+                        _logger.LogDebug("Using cached price for {Symbol}: ₹{Price}", symbol, cached.Price);
                     }
-
-                    bool shouldTrigger = alert.IsAbove
-                        ? stock.Price >= alert.TargetPrice
-                        : stock.Price <= alert.TargetPrice;
-
-                    if (shouldTrigger)
+                    else
                     {
-                        alert.IsTriggered = true;
-                        alert.TriggeredAt = DateTime.Now;
-                        alert.TriggeredPrice = stock.Price;
-                        triggeredAlerts.Add((chatId, alert, stock.Price));
-                        _logger.LogDebug("Alert triggered for {Symbol} at ₹{Price}", alert.Symbol, stock.Price);
+                        symbolsToFetch.Add(symbol);
+                    }
+                }
+
+                // Fetch fresh prices for symbols not in cache
+                if (symbolsToFetch.Any())
+                {
+                    _logger.LogDebug("Fetching fresh prices for {Count} symbols", symbolsToFetch.Count);
+
+                    try
+                    {
+                        // Use bulk API to get all quotes at once
+                        var quotes = await angelOneService.GetMultipleQuotesAsync(symbolsToFetch);
+
+                        foreach (var quote in quotes.Where(q => q != null))
+                        {
+                            stockData[quote.Symbol] = quote;
+                            // Cache the price for 1 minute
+                            _cacheService.Set($"alert_price_{quote.Symbol}", quote, TimeSpan.FromSeconds(PRICE_CACHE_DURATION_SECONDS));
+                            _logger.LogDebug("Cached price for {Symbol}: ₹{Price}", quote.Symbol, quote.Price);
+                        }
+
+                        // Check for any symbols that weren't fetched
+                        var missingSymbols = symbolsToFetch.Except(stockData.Keys).ToList();
+                        foreach (var symbol in missingSymbols)
+                        {
+                            _logger.LogWarning("Could not fetch price for {Symbol}", symbol);
+                            stockData[symbol] = null;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Bulk quote fetch failed for {Count} symbols, falling back to individual calls", symbolsToFetch.Count);
+
+                        // Fallback to individual calls if bulk fails
+                        foreach (var symbol in symbolsToFetch)
+                        {
+                            if (stoppingToken.IsCancellationRequested)
+                                break;
+
+                            try
+                            {
+                                var stock = await angelOneService.GetLiveQuoteAsync(symbol);
+                                stockData[symbol] = stock;
+                                if (stock != null)
+                                {
+                                    _cacheService.Set($"alert_price_{symbol}", stock, TimeSpan.FromSeconds(PRICE_CACHE_DURATION_SECONDS));
+                                }
+                                await Task.Delay(100, stoppingToken);
+                            }
+                            catch (Exception ex2)
+                            {
+                                _logger.LogError(ex2, "Error fetching price for {Symbol}", symbol);
+                                stockData[symbol] = null;
+                            }
+                        }
+                    }
+                }
+
+                var triggeredAlerts = new List<(long chatId, UserAlert alert, decimal price)>();
+
+                lock (_alertLock)
+                {
+                    foreach (var (chatId, alert) in alertsToCheck)
+                    {
+                        if (!stockData.TryGetValue(alert.Symbol, out var stock) || stock == null)
+                        {
+                            _logger.LogDebug("No stock data available for {Symbol}, skipping alert check", alert.Symbol);
+                            continue;
+                        }
+
+                        bool shouldTrigger = alert.IsAbove
+                            ? stock.Price >= alert.TargetPrice
+                            : stock.Price <= alert.TargetPrice;
+
+                        if (shouldTrigger)
+                        {
+                            alert.IsTriggered = true;
+                            alert.TriggeredAt = DateTime.Now;
+                            alert.TriggeredPrice = stock.Price;
+                            triggeredAlerts.Add((chatId, alert, stock.Price));
+                            _logger.LogDebug("Alert triggered for {Symbol} at ₹{Price}", alert.Symbol, stock.Price);
+                        }
+                    }
+                }
+
+                // Send notifications outside lock
+                if (triggeredAlerts.Any())
+                {
+                    _logger.LogInformation("Triggered {Count} alerts", triggeredAlerts.Count);
+
+                    foreach (var (chatId, alert, price) in triggeredAlerts)
+                    {
+                        if (stoppingToken.IsCancellationRequested)
+                            break;
+
+                        try
+                        {
+                            var direction = alert.IsAbove ? "above" : "below";
+                            var emoji = alert.IsAbove ? "📈" : "📉";
+
+                            await telegram.SendMessageAsync(chatId,
+                                $"{emoji} <b>Price Alert Triggered!</b>\n\n" +
+                                $"{alert.Symbol} has moved {direction} ₹{alert.TargetPrice:F2}\n" +
+                                $"Current Price: ₹{price:F2}\n" +
+                                $"Set on: {alert.CreatedAt:dd MMM yyyy HH:mm}",
+                                Telegram.Bot.Types.Enums.ParseMode.Html);
+
+                            _logger.LogInformation("Alert triggered for user {ChatId}: {Symbol} at ₹{Price}",
+                                chatId, alert.Symbol, price);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error sending alert notification to {ChatId}", chatId);
+                        }
                     }
                 }
             }
-
-            // Send notifications outside lock
-            foreach (var (chatId, alert, price) in triggeredAlerts)
+            catch (OperationCanceledException)
             {
-                try
-                {
-                    var direction = alert.IsAbove ? "above" : "below";
-                    var emoji = alert.IsAbove ? "📈" : "📉";
-
-                    await telegram.SendMessageAsync(chatId,
-                        $"{emoji} <b>Price Alert Triggered!</b>\n\n" +
-                        $"{alert.Symbol} has moved {direction} ₹{alert.TargetPrice:F2}\n" +
-                        $"Current Price: ₹{price:F2}\n" +
-                        $"Set on: {alert.CreatedAt:dd MMM yyyy HH:mm}",
-                        Telegram.Bot.Types.Enums.ParseMode.Html);
-
-                    _logger.LogInformation("Alert triggered for user {ChatId}: {Symbol} at ₹{Price}",
-                        chatId, alert.Symbol, price);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error sending alert notification to {ChatId}", chatId);
-                }
+                _logger.LogDebug("Alert check cancelled");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error checking alerts");
+            }
+            finally
+            {
+                _isChecking = false;
+                _alertCheckLock.Release();
             }
         }
 
@@ -285,6 +397,19 @@ namespace StockNotificationApi.Services
 
             _logger.LogInformation("Cleaned up alerts older than {DaysOld} days", daysOld);
             return Task.CompletedTask;
+        }
+
+        // Method to get alert statistics
+        public (int TotalAlerts, int TriggeredAlerts, int ActiveAlerts) GetAlertStats()
+        {
+            lock (_alertLock)
+            {
+                var totalAlerts = _userAlerts.Values.Sum(list => list.Count);
+                var triggeredAlerts = _userAlerts.Values.Sum(list => list.Count(a => a.IsTriggered));
+                var activeAlerts = totalAlerts - triggeredAlerts;
+
+                return (totalAlerts, triggeredAlerts, activeAlerts);
+            }
         }
     }
 }

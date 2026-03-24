@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json.Linq;
+using StockNotificationApi.Constants;
 using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
@@ -14,23 +15,23 @@ namespace StockNotificationApi.Services
         private readonly string _apiKey;
         private readonly string _apiUrl;
 
-        // Constants from EnhancedAIService
-        private const double DEFAULT_TEMPERATURE = 0.2;
-        private const int DEFAULT_TOP_K = 1;
-        private const int DEFAULT_TOP_P = 1;
-        private const int DEFAULT_MAX_TOKENS = 2048;
-        private const int RATE_LIMIT_DELAY_MS = 1000;
-        private const int MAX_RETRIES = 3;
+        // Use constants from Constants.cs
+        private const double DEFAULT_TEMPERATURE = GeminiConstants.DEFAULT_TEMPERATURE;
+        private const int DEFAULT_TOP_K = GeminiConstants.DEFAULT_TOP_K;
+        private const int DEFAULT_TOP_P = GeminiConstants.DEFAULT_TOP_P;
+        private const int DEFAULT_MAX_TOKENS = GeminiConstants.DEFAULT_MAX_TOKENS;
+        private const int RATE_LIMIT_DELAY_MS = RateLimitConstants.RATE_LIMIT_DELAY_MS;
+        private const int MAX_RETRIES = TimeoutConstants.MAX_RETRY_ATTEMPTS;
 
-        // Thresholds from GeminiAIService
-        private const decimal BULLISH_THRESHOLD = 1m;
-        private const decimal BEARISH_THRESHOLD = -1m;
-        private const decimal BUY_THRESHOLD = 2m;
-        private const decimal SELL_THRESHOLD = -2m;
-        private const decimal HIGH_RISK_THRESHOLD = 3m;
-        private const decimal MEDIUM_RISK_THRESHOLD = 1m;
-        private const decimal STRONG_MOMENTUM_THRESHOLD = 2m;
-        private const decimal SIGNIFICANT_DECLINE_THRESHOLD = -2m;
+        // Thresholds
+        private const decimal BULLISH_THRESHOLD = StockConstants.BULLISH_THRESHOLD;
+        private const decimal BEARISH_THRESHOLD = StockConstants.BEARISH_THRESHOLD;
+        private const decimal BUY_THRESHOLD = StockConstants.BUY_THRESHOLD;
+        private const decimal SELL_THRESHOLD = StockConstants.SELL_THRESHOLD;
+        private const decimal HIGH_RISK_THRESHOLD = StockConstants.HIGH_RISK_THRESHOLD;
+        private const decimal MEDIUM_RISK_THRESHOLD = StockConstants.MEDIUM_RISK_THRESHOLD;
+        private const decimal STRONG_MOMENTUM_THRESHOLD = StockConstants.STRONG_MOMENTUM_THRESHOLD;
+        private const decimal SIGNIFICANT_DECLINE_THRESHOLD = StockConstants.SIGNIFICANT_DECLINE_THRESHOLD;
 
         public GeminiService(
             HttpClient httpClient,

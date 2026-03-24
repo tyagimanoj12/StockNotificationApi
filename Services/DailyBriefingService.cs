@@ -1,4 +1,5 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
 using System.Text.Json;
@@ -15,19 +16,32 @@ namespace StockNotificationApi.Services
         private readonly ILogger<DailyBriefingService> _logger;
         private readonly ITelegramBotService _telegramBot;
         private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ICacheService _cache;
 
-        // Constants
-        private const int LARGE_CAP_THRESHOLD = 20000;
-        private const int MID_CAP_THRESHOLD = 5000;
-        private const int MAX_PICKS_PER_CATEGORY = 10;
-        private const int TOP_NEWS_COUNT = 10;
-        private const int PORTFOLIO_DISPLAY_LIMIT = 5;
-        private const int RATE_LIMIT_DELAY_MS = 100;
+        // Use constants from Constants.cs
+        private const int LARGE_CAP_THRESHOLD = MarketConstants.LARGE_CAP_THRESHOLD;
+        private const int MID_CAP_THRESHOLD = MarketConstants.MID_CAP_THRESHOLD;
+        private const int MAX_PICKS_PER_CATEGORY = StockConstants.MAX_PICKS_PER_CATEGORY;
+        private const int TOP_NEWS_COUNT = NewsConstants.TOP_NEWS_COUNT;
+        private const int PORTFOLIO_DISPLAY_LIMIT = PortfolioConstants.PORTFOLIO_DISPLAY_LIMIT;
+        private const int RATE_LIMIT_DELAY_MS = RateLimitConstants.RATE_LIMIT_DELAY_MS;
 
-        // Yahoo Finance symbols for Indian indices
-        private const string YAHOO_NIFTY_SYMBOL = "^NSEI";
-        private const string YAHOO_SENSEX_SYMBOL = "^BSESN";
-        private const string YAHOO_BANKNIFTY_SYMBOL = "^NSEBANK";
+        // Yahoo Finance symbols
+        private const string YAHOO_NIFTY_SYMBOL = NewsConstants.YAHOO_NIFTY_SYMBOL;
+        private const string YAHOO_SENSEX_SYMBOL = NewsConstants.YAHOO_SENSEX_SYMBOL;
+        private const string YAHOO_BANKNIFTY_SYMBOL = NewsConstants.YAHOO_BANKNIFTY_SYMBOL;
+
+        // Cache constants
+        private const int BRIEFING_CACHE_MINUTES = CacheConstants.BRIEFING_CACHE_MINUTES;
+        private const int INDICES_CACHE_MINUTES = 5; // Cache indices for 5 minutes
+        private const int SECTOR_PERFORMANCE_CACHE_MINUTES = 10; // Cache sector performance
+
+        // Timeout
+        private const int HTTP_TIMEOUT_SECONDS = TimeoutConstants.HTTP_TIMEOUT_SECONDS;
+
+        // Cache keys
+        private const string INDICES_CACHE_KEY = "market_indices";
+        private const string SECTOR_PERFORMANCE_CACHE_KEY = "sector_performance";
 
         public DailyBriefingService(
             IStockService stockService,
@@ -37,7 +51,8 @@ namespace StockNotificationApi.Services
             IPortfolioService portfolioService,
             ITelegramBotService telegramBot,
             IHttpClientFactory httpClientFactory,
-            ILogger<DailyBriefingService> logger)
+            ILogger<DailyBriefingService> logger,
+            ICacheService cache)
         {
             _stockService = stockService ?? throw new ArgumentNullException(nameof(stockService));
             _stockListService = stockListService ?? throw new ArgumentNullException(nameof(stockListService));
@@ -47,62 +62,87 @@ namespace StockNotificationApi.Services
             _telegramBot = telegramBot ?? throw new ArgumentNullException(nameof(telegramBot));
             _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         }
 
         public async Task<DailyBriefing> GenerateDailyBriefingAsync()
         {
-            _logger.LogInformation("Generating daily briefing...");
-
-            var briefing = new DailyBriefing
+            // Use cache for daily briefing
+            return await _cache.GetOrSetAsync("daily_briefing", async () =>
             {
-                Date = DateTime.Now,
-                Indices = await GetMarketIndicesAsync(),
-                LargeCapPicks = new List<StockPrediction>(),
-                MidCapPicks = new List<StockPrediction>(),
-                SmallCapPicks = new List<StockPrediction>(),
-                TopNews = new List<StockNews>(),
-                SectorPerformance = new Dictionary<string, string>()
-            };
+                _logger.LogInformation("Cache miss for daily briefing, generating...");
 
-            try
+                var briefing = new DailyBriefing
+                {
+                    Date = DateTime.Now,
+                    Indices = await GetCachedMarketIndicesAsync(),
+                    LargeCapPicks = new List<StockPrediction>(),
+                    MidCapPicks = new List<StockPrediction>(),
+                    SmallCapPicks = new List<StockPrediction>(),
+                    TopNews = new List<StockNews>(),
+                    SectorPerformance = await GetCachedSectorPerformanceAsync()
+                };
+
+                try
+                {
+                    // Get all stocks once and reuse
+                    var allStocks = await _stockService.GetIndianStockDataAsync();
+                    if (allStocks == null || !allStocks.Any())
+                    {
+                        _logger.LogWarning("No stock data available for briefing");
+                        return briefing;
+                    }
+
+                    // Categorize by market cap
+                    var categorized = await CategorizeStocksByMarketCap(allStocks);
+
+                    // Get AI predictions for each category
+                    briefing.LargeCapPicks = await GetTopPredictions(categorized.LargeCap, MAX_PICKS_PER_CATEGORY);
+                    briefing.MidCapPicks = await GetTopPredictions(categorized.MidCap, MAX_PICKS_PER_CATEGORY);
+                    briefing.SmallCapPicks = await GetTopPredictions(categorized.SmallCap, MAX_PICKS_PER_CATEGORY);
+
+                    // Get market summary using the same stock data
+                    briefing.MarketSummary = await _aiService.GetMarketInsightAsync(allStocks) ?? "Market summary unavailable";
+
+                    // Get top news
+                    briefing.TopNews = await _newsService.GetTopMarketNewsAsync(TOP_NEWS_COUNT) ?? new List<StockNews>();
+
+                    // Determine top pick
+                    briefing.TopPick = DetermineTopPick(briefing.LargeCapPicks, briefing.MidCapPicks, briefing.SmallCapPicks);
+
+                    _logger.LogInformation("Daily briefing generated successfully with {LargeCount} large, {MidCount} mid, {SmallCount} small cap picks",
+                        briefing.LargeCapPicks.Count, briefing.MidCapPicks.Count, briefing.SmallCapPicks.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error generating daily briefing");
+                }
+
+                return briefing;
+            }, TimeSpan.FromMinutes(BRIEFING_CACHE_MINUTES));
+        }
+
+        private async Task<MarketIndices> GetCachedMarketIndicesAsync()
+        {
+            return await _cache.GetOrSetAsync(INDICES_CACHE_KEY, async () =>
             {
-                // Get all stocks
+                _logger.LogInformation("Cache miss for market indices, fetching...");
+                return await GetMarketIndicesAsync();
+            }, TimeSpan.FromMinutes(INDICES_CACHE_MINUTES));
+        }
+
+        private async Task<Dictionary<string, string>> GetCachedSectorPerformanceAsync()
+        {
+            return await _cache.GetOrSetAsync(SECTOR_PERFORMANCE_CACHE_KEY, async () =>
+            {
+                _logger.LogInformation("Cache miss for sector performance, calculating...");
                 var allStocks = await _stockService.GetIndianStockDataAsync();
                 if (allStocks == null || !allStocks.Any())
                 {
-                    _logger.LogWarning("No stock data available for briefing");
-                    return briefing;
+                    return new Dictionary<string, string>();
                 }
-
-                // Categorize by market cap
-                var categorized = await CategorizeStocksByMarketCap(allStocks);
-
-                // Get AI predictions for each category
-                briefing.LargeCapPicks = await GetTopPredictions(categorized.LargeCap, MAX_PICKS_PER_CATEGORY);
-                briefing.MidCapPicks = await GetTopPredictions(categorized.MidCap, MAX_PICKS_PER_CATEGORY);
-                briefing.SmallCapPicks = await GetTopPredictions(categorized.SmallCap, MAX_PICKS_PER_CATEGORY);
-
-                // Get market summary
-                briefing.MarketSummary = await _aiService.GetMarketInsightAsync(allStocks) ?? "Market summary unavailable";
-
-                // Get top news
-                briefing.TopNews = await _newsService.GetTopMarketNewsAsync(TOP_NEWS_COUNT) ?? new List<StockNews>();
-
-                // Calculate sector performance
-                briefing.SectorPerformance = await CalculateSectorPerformance(allStocks);
-
-                // Determine top pick
-                briefing.TopPick = DetermineTopPick(briefing.LargeCapPicks, briefing.MidCapPicks, briefing.SmallCapPicks);
-
-                _logger.LogInformation("Daily briefing generated successfully with {LargeCount} large, {MidCount} mid, {SmallCount} small cap picks",
-                    briefing.LargeCapPicks.Count, briefing.MidCapPicks.Count, briefing.SmallCapPicks.Count);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error generating daily briefing");
-            }
-
-            return briefing;
+                return await CalculateSectorPerformance(allStocks);
+            }, TimeSpan.FromMinutes(SECTOR_PERFORMANCE_CACHE_MINUTES));
         }
 
         public async Task SendBriefingToUserAsync(long chatId)
@@ -311,7 +351,7 @@ namespace StockNotificationApi.Services
             {
                 var client = _httpClientFactory.CreateClient();
                 client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                client.Timeout = TimeSpan.FromSeconds(30);
+                client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
 
                 // Fetch all indices in parallel
                 var tasks = new[]
@@ -356,7 +396,6 @@ namespace StockNotificationApi.Services
                 using var jsonDoc = JsonDocument.Parse(content);
                 var root = jsonDoc.RootElement;
 
-                // Navigate to the quote data
                 if (root.TryGetProperty("chart", out var chart) &&
                     chart.TryGetProperty("result", out var result) &&
                     result.ValueKind == JsonValueKind.Array &&
@@ -369,16 +408,12 @@ namespace StockNotificationApi.Services
                         var indexData = new IndexData
                         {
                             Name = GetIndexName(symbol),
-                            Value = meta.TryGetProperty("regularMarketPrice", out var price) ?
-                                    price.GetDecimal() : 0,
-                            PreviousClose = meta.TryGetProperty("previousClose", out var prevClose) ?
-                                           prevClose.GetDecimal() : 0
+                            Value = meta.TryGetProperty("regularMarketPrice", out var price) ? price.GetDecimal() : 0,
+                            PreviousClose = meta.TryGetProperty("previousClose", out var prevClose) ? prevClose.GetDecimal() : 0
                         };
 
-                        // Calculate change and change percent
                         indexData.Change = indexData.Value - indexData.PreviousClose;
-                        indexData.ChangePercent = indexData.PreviousClose > 0 ?
-                            (indexData.Change / indexData.PreviousClose) * 100 : 0;
+                        indexData.ChangePercent = indexData.PreviousClose > 0 ? (indexData.Change / indexData.PreviousClose) * 100 : 0;
 
                         return indexData;
                     }

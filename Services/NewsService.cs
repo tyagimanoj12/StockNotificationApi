@@ -1,7 +1,8 @@
-﻿using StockNotificationApi.Models;
-using System.Text.Json;
-using System.Text;
+﻿using StockNotificationApi.Constants;
 using StockNotificationApi.Interfaces;
+using StockNotificationApi.Models;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml;
 
@@ -12,14 +13,23 @@ namespace StockNotificationApi.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<NewsService> _logger;
         private readonly IConfiguration _configuration;
+        private readonly ICacheService _cache; // Added
 
-        // Constants
-        private const int HTTP_TIMEOUT_SECONDS = 30;
-        private const int MAX_NEWS_ITEMS = 10;
-        private const int NEWS_BATCH_SIZE = 5;
-        private const int RATE_LIMIT_DELAY_MS = 1000;
-        private const int MAX_NEWS_AGE_DAYS = 1;
-        private const int YAHOO_NEWS_COUNT = 5;
+        // Use constants from Constants.cs
+        private const int HTTP_TIMEOUT_SECONDS = TimeoutConstants.HTTP_TIMEOUT_SECONDS;
+        private const int MAX_NEWS_ITEMS = NewsConstants.MAX_NEWS_ITEMS;
+        private const int NEWS_BATCH_SIZE = RateLimitConstants.NEWS_BATCH_SIZE;
+        private const int RATE_LIMIT_DELAY_MS = RateLimitConstants.RATE_LIMIT_DELAY_MS;
+        private const int MAX_NEWS_AGE_DAYS = NewsConstants.MAX_NEWS_AGE_DAYS;
+        private const int YAHOO_NEWS_COUNT = NewsConstants.YAHOO_NEWS_COUNT;
+
+        // Cache constants
+        private const int MARKET_NEWS_CACHE_MINUTES = CacheConstants.MARKET_NEWS_CACHE_MINUTES;
+        private const int STOCK_NEWS_CACHE_MINUTES = CacheConstants.STOCK_NEWS_CACHE_MINUTES;
+        private const int NEWS_SUMMARY_CACHE_MINUTES = CacheConstants.NEWS_SUMMARY_CACHE_MINUTES;
+
+        // Yahoo endpoints
+        private const string YAHOO_SEARCH_URL = EndpointConstants.YAHOO_SEARCH_URL;
 
         private static readonly HashSet<string> PositiveWords = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -36,11 +46,13 @@ namespace StockNotificationApi.Services
         public NewsService(
             IHttpClientFactory httpClientFactory,
             ILogger<NewsService> logger,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            ICacheService cache) // Added
         {
             _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         }
 
         public async Task<List<StockNews>> GetStockNewsAsync(string symbol, int days = 1)
@@ -53,105 +65,119 @@ namespace StockNotificationApi.Services
 
             if (days <= 0) days = MAX_NEWS_AGE_DAYS;
 
-            var newsList = new List<StockNews>();
+            // Use cache for stock-specific news
+            var cacheKey = $"stock_news_{symbol}_{days}";
 
-            try
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
             {
-                _logger.LogInformation("Fetching news for symbol: {Symbol}", symbol);
+                _logger.LogInformation("Cache miss for news for symbol: {Symbol}", symbol);
 
-                // Try multiple sources
-                var tasks = new List<Task<List<StockNews>>>
+                var newsList = new List<StockNews>();
+
+                try
                 {
-                    GetFromGoogleNewsAsync(symbol),
-                    GetFromYahooFinanceNewsAsync(symbol)
-                };
-
-                var results = await Task.WhenAll(tasks);
-
-                foreach (var result in results)
-                {
-                    if (result?.Any() == true)
+                    // Try multiple sources
+                    var tasks = new List<Task<List<StockNews>>>
                     {
-                        newsList.AddRange(result);
+                        GetFromGoogleNewsAsync(symbol),
+                        GetFromYahooFinanceNewsAsync(symbol)
+                    };
+
+                    var results = await Task.WhenAll(tasks);
+
+                    foreach (var result in results)
+                    {
+                        if (result?.Any() == true)
+                        {
+                            newsList.AddRange(result);
+                        }
                     }
+
+                    // Filter by date and analyze sentiment
+                    var cutoff = DateTime.UtcNow.AddDays(-days);
+                    newsList = newsList
+                        .Where(n => n != null && n.PublishedAt >= cutoff)
+                        .DistinctBy(n => n.Title) // Remove duplicates by title
+                        .ToList();
+
+                    foreach (var news in newsList)
+                    {
+                        news.Sentiment = AnalyzeSentiment(news);
+
+                        // Extract affected stocks from title
+                        news.AffectedStocks = ExtractStockSymbols(news.Title);
+                    }
+
+                    _logger.LogInformation("Retrieved {Count} news items for {Symbol}", newsList.Count, symbol);
                 }
-
-                // Filter by date and analyze sentiment
-                var cutoff = DateTime.UtcNow.AddDays(-days);
-                newsList = newsList
-                    .Where(n => n != null && n.PublishedAt >= cutoff)
-                    .DistinctBy(n => n.Title) // Remove duplicates by title
-                    .ToList();
-
-                foreach (var news in newsList)
+                catch (Exception ex)
                 {
-                    news.Sentiment = AnalyzeSentiment(news);
-
-                    // Extract affected stocks from title
-                    news.AffectedStocks = ExtractStockSymbols(news.Title);
+                    _logger.LogError(ex, "Error fetching news for {Symbol}", symbol);
                 }
 
-                _logger.LogInformation("Retrieved {Count} news items for {Symbol}", newsList.Count, symbol);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching news for {Symbol}", symbol);
-            }
-
-            return newsList.Take(MAX_NEWS_ITEMS).ToList();
+                return newsList.Take(MAX_NEWS_ITEMS).ToList();
+            }, TimeSpan.FromMinutes(STOCK_NEWS_CACHE_MINUTES));
         }
 
         public async Task<List<StockNews>> GetTopMarketNewsAsync(int count = 10)
         {
             if (count <= 0) count = MAX_NEWS_ITEMS;
 
-            var allNews = new List<StockNews>();
+            // Use cache for market news
+            var cacheKey = "top_market_news";
 
-            try
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
             {
-                _logger.LogInformation("Fetching top market news");
+                _logger.LogInformation("Cache miss for top market news");
 
-                var client = CreateHttpClient();
-                var tasks = new List<Task<List<StockNews>>>();
+                var allNews = new List<StockNews>();
 
-                // Google News RSS for Indian market
-                tasks.Add(GetGoogleMarketNewsAsync(client));
-
-                // Moneycontrol headlines
-                tasks.Add(GetMoneycontrolNewsAsync(client));
-
-                var results = await Task.WhenAll(tasks);
-
-                foreach (var result in results)
+                try
                 {
-                    if (result?.Any() == true)
+                    _logger.LogInformation("Fetching top market news");
+
+                    var client = CreateHttpClient();
+                    var tasks = new List<Task<List<StockNews>>>();
+
+                    // Google News RSS for Indian market
+                    tasks.Add(GetGoogleMarketNewsAsync(client));
+
+                    // Moneycontrol headlines
+                    tasks.Add(GetMoneycontrolNewsAsync(client));
+
+                    var results = await Task.WhenAll(tasks);
+
+                    foreach (var result in results)
                     {
-                        allNews.AddRange(result);
+                        if (result?.Any() == true)
+                        {
+                            allNews.AddRange(result);
+                        }
                     }
+
+                    // Remove duplicates and sort by date
+                    allNews = allNews
+                        .Where(n => n != null)
+                        .DistinctBy(n => n.Title)
+                        .OrderByDescending(n => n.PublishedAt)
+                        .ToList();
+
+                    // Extract affected stocks for each news item
+                    foreach (var news in allNews)
+                    {
+                        news.AffectedStocks = ExtractStockSymbols(news.Title);
+                        news.Impact = DetermineImpact(news.Title);
+                    }
+
+                    _logger.LogInformation("Retrieved {Count} market news items", allNews.Count);
                 }
-
-                // Remove duplicates and sort by date
-                allNews = allNews
-                    .Where(n => n != null)
-                    .DistinctBy(n => n.Title)
-                    .OrderByDescending(n => n.PublishedAt)
-                    .ToList();
-
-                // Extract affected stocks for each news item
-                foreach (var news in allNews)
+                catch (Exception ex)
                 {
-                    news.AffectedStocks = ExtractStockSymbols(news.Title);
-                    news.Impact = DetermineImpact(news.Title);
+                    _logger.LogError(ex, "Error fetching market news");
                 }
 
-                _logger.LogInformation("Retrieved {Count} market news items", allNews.Count);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching market news");
-            }
-
-            return allNews.Take(count).ToList();
+                return allNews.Take(count).ToList();
+            }, TimeSpan.FromMinutes(MARKET_NEWS_CACHE_MINUTES));
         }
 
         public async Task<Dictionary<string, List<StockNews>>> GetNewsForSymbolsAsync(List<string> symbols)
@@ -162,30 +188,39 @@ namespace StockNotificationApi.Services
                 return new Dictionary<string, List<StockNews>>();
             }
 
-            var result = new Dictionary<string, List<StockNews>>();
+            // Use cache for batch news - create a combined cache key
+            var sortedSymbols = symbols.OrderBy(s => s).ToList();
+            var combinedKey = $"batch_news_{string.Join("_", sortedSymbols.Take(5))}_{symbols.Count}";
 
-            for (int i = 0; i < symbols.Count; i += NEWS_BATCH_SIZE)
+            return await _cache.GetOrSetAsync(combinedKey, async () =>
             {
-                var batch = symbols.Skip(i).Take(NEWS_BATCH_SIZE).ToList();
-                var tasks = batch.Select(s => GetStockNewsAsync(s, MAX_NEWS_AGE_DAYS));
-                var newsResults = await Task.WhenAll(tasks);
+                _logger.LogInformation("Cache miss for batch news for {Count} symbols", symbols.Count);
 
-                for (int j = 0; j < batch.Count; j++)
+                var result = new Dictionary<string, List<StockNews>>();
+
+                for (int i = 0; i < symbols.Count; i += NEWS_BATCH_SIZE)
                 {
-                    if (newsResults[j]?.Any() == true)
+                    var batch = symbols.Skip(i).Take(NEWS_BATCH_SIZE).ToList();
+                    var tasks = batch.Select(s => GetStockNewsAsync(s, MAX_NEWS_AGE_DAYS));
+                    var newsResults = await Task.WhenAll(tasks);
+
+                    for (int j = 0; j < batch.Count; j++)
                     {
-                        result[batch[j]] = newsResults[j];
+                        if (newsResults[j]?.Any() == true)
+                        {
+                            result[batch[j]] = newsResults[j];
+                        }
+                    }
+
+                    if (i + NEWS_BATCH_SIZE < symbols.Count)
+                    {
+                        await Task.Delay(RATE_LIMIT_DELAY_MS);
                     }
                 }
 
-                if (i + NEWS_BATCH_SIZE < symbols.Count)
-                {
-                    await Task.Delay(RATE_LIMIT_DELAY_MS);
-                }
-            }
-
-            _logger.LogInformation("Retrieved news for {Count} symbols", result.Count);
-            return result;
+                _logger.LogInformation("Retrieved news for {Count} symbols", result.Count);
+                return result;
+            }, TimeSpan.FromMinutes(STOCK_NEWS_CACHE_MINUTES));
         }
 
         public async Task<string> GetNewsSummaryAsync(List<StockNews> news)
@@ -193,43 +228,52 @@ namespace StockNotificationApi.Services
             if (news == null || !news.Any())
                 return "No significant news today.";
 
-            var positive = news.Count(n => n?.Sentiment == "Positive");
-            var negative = news.Count(n => n?.Sentiment == "Negative");
-            var neutral = news.Count(n => n?.Sentiment == "Neutral");
+            // Create a cache key based on the first few news titles
+            var newsHash = string.Join("_", news.Take(5).Select(n => n.Title?.GetHashCode() ?? 0));
+            var cacheKey = $"news_summary_{newsHash}";
 
-            var sb = new StringBuilder();
-            sb.AppendLine("📰 <b>Market News Summary</b>");
-            sb.AppendLine($"Positive: {positive} | Negative: {negative} | Neutral: {neutral}\n");
-
-            foreach (var item in news.Where(n => n != null).Take(5))
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
             {
-                var emoji = GetSentimentEmoji(item.Sentiment);
+                _logger.LogInformation("Cache miss for news summary");
 
-                // Show FULL title - no truncation!
-                sb.AppendLine($"{emoji} <b>{item.Symbol ?? "Market"}</b>: {item.Title}");
+                var positive = news.Count(n => n?.Sentiment == "Positive");
+                var negative = news.Count(n => n?.Sentiment == "Negative");
+                var neutral = news.Count(n => n?.Sentiment == "Neutral");
 
-                // Show affected stocks if available
-                if (item.AffectedStocks?.Any() == true)
+                var sb = new StringBuilder();
+                sb.AppendLine("📰 <b>Market News Summary</b>");
+                sb.AppendLine($"Positive: {positive} | Negative: {negative} | Neutral: {neutral}\n");
+
+                foreach (var item in news.Where(n => n != null).Take(5))
                 {
-                    sb.AppendLine($"   📊 Affects: {string.Join(", ", item.AffectedStocks.Take(3))}");
+                    var emoji = GetSentimentEmoji(item.Sentiment);
+
+                    // Show FULL title - no truncation!
+                    sb.AppendLine($"{emoji} <b>{item.Symbol ?? "Market"}</b>: {item.Title}");
+
+                    // Show affected stocks if available
+                    if (item.AffectedStocks?.Any() == true)
+                    {
+                        sb.AppendLine($"   📊 Affects: {string.Join(", ", item.AffectedStocks.Take(3))}");
+                    }
+
+                    // Show impact if available
+                    if (!string.IsNullOrEmpty(item.Impact))
+                    {
+                        sb.AppendLine($"   {item.Impact}");
+                    }
+
+                    if (!string.IsNullOrEmpty(item.Summary))
+                    {
+                        sb.AppendLine($"   <i>{TruncateText(item.Summary, 150)}</i>");
+                    }
+
+                    sb.AppendLine($"   📅 {item.PublishedAt:HH:mm} | {item.Source ?? "Unknown"}");
+                    sb.AppendLine();
                 }
 
-                // Show impact if available
-                if (!string.IsNullOrEmpty(item.Impact))
-                {
-                    sb.AppendLine($"   {item.Impact}");
-                }
-
-                if (!string.IsNullOrEmpty(item.Summary))
-                {
-                    sb.AppendLine($"   <i>{TruncateText(item.Summary, 150)}</i>");
-                }
-
-                sb.AppendLine($"   📅 {item.PublishedAt:HH:mm} | {item.Source ?? "Unknown"}");
-                sb.AppendLine();
-            }
-
-            return sb.ToString();
+                return sb.ToString();
+            }, TimeSpan.FromMinutes(NEWS_SUMMARY_CACHE_MINUTES));
         }
 
         #region Private Methods
@@ -237,7 +281,7 @@ namespace StockNotificationApi.Services
         private HttpClient CreateHttpClient()
         {
             var client = _httpClientFactory.CreateClient();
-            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
             client.DefaultRequestHeaders.Add("Accept", "application/rss+xml, application/xml, text/xml");
             client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
             return client;
@@ -531,5 +575,20 @@ namespace StockNotificationApi.Services
         }
 
         #endregion
+    }
+
+    // Yahoo News Response DTO (keep at bottom of file)
+    public class YahooNewsResponse
+    {
+        public List<YahooNewsItem>? news { get; set; }
+    }
+
+    public class YahooNewsItem
+    {
+        public string? title { get; set; }
+        public string? summary { get; set; }
+        public string? publisher { get; set; }
+        public string? link { get; set; }
+        public long providerPublishTime { get; set; }
     }
 }

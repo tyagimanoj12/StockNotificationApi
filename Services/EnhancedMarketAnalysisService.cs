@@ -1,4 +1,5 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
 using System.Text.Json;
@@ -13,23 +14,33 @@ namespace StockNotificationApi.Services
         private readonly INewsService _newsService;
         private readonly ILogger<EnhancedMarketAnalysisService> _logger;
         private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ICacheService _cache;
 
-        // Constants
-        private const int LARGE_CAP_THRESHOLD = 20000;
-        private const int MID_CAP_THRESHOLD = 5000;
-        private const int MAX_STOCKS_PER_CATEGORY = 30;
-        private const int DEFAULT_CONFIDENCE = 70;
-        private const int LARGE_CAP_PICKS_REQUIRED = 5;
-        private const int MID_CAP_PICKS_REQUIRED = 3;
-        private const int SMALL_CAP_PICKS_REQUIRED = 3;
-        private const int API_RATE_LIMIT_DELAY_MS = 200;
-        private const int MAX_NEWS_ITEMS = 20;
+        // Use constants from Constants.cs
+        private const int LARGE_CAP_THRESHOLD = MarketConstants.LARGE_CAP_THRESHOLD;
+        private const int MID_CAP_THRESHOLD = MarketConstants.MID_CAP_THRESHOLD;
+        private const int MAX_STOCKS_PER_CATEGORY = StockConstants.MAX_STOCKS_PER_CATEGORY;
+        private const int DEFAULT_CONFIDENCE = StockConstants.DEFAULT_CONFIDENCE;
+        private const int LARGE_CAP_PICKS_REQUIRED = StockConstants.LARGE_CAP_PICKS_REQUIRED;
+        private const int MID_CAP_PICKS_REQUIRED = StockConstants.MID_CAP_PICKS_REQUIRED;
+        private const int SMALL_CAP_PICKS_REQUIRED = StockConstants.SMALL_CAP_PICKS_REQUIRED;
+        private const int API_RATE_LIMIT_DELAY_MS = RateLimitConstants.API_RATE_LIMIT_DELAY_MS;
+        private const int MAX_NEWS_ITEMS = NewsConstants.MAX_NEWS_ITEMS;
         private const int HISTORICAL_DAYS = 10;
-        private const int MAX_PICKS_PER_CATEGORY = 15;
-        private const decimal STRONG_MOMENTUM_THRESHOLD = 2m;
-        private const decimal HIGH_CONFIDENCE_THRESHOLD = 5m;
-        private const decimal MEDIUM_CONFIDENCE_THRESHOLD = 3m;
-        private const decimal LOW_CONFIDENCE_THRESHOLD = 1m;
+        private const int MAX_PICKS_PER_CATEGORY = StockConstants.MAX_PICKS_PER_CATEGORY;
+
+        // Thresholds
+        private const decimal STRONG_MOMENTUM_THRESHOLD = StockConstants.STRONG_MOMENTUM_THRESHOLD;
+        private const decimal HIGH_CONFIDENCE_THRESHOLD = StockConstants.HIGH_CONFIDENCE_THRESHOLD;
+        private const decimal MEDIUM_CONFIDENCE_THRESHOLD = StockConstants.MEDIUM_CONFIDENCE_THRESHOLD;
+        private const decimal LOW_CONFIDENCE_THRESHOLD = StockConstants.LOW_CONFIDENCE_THRESHOLD;
+
+        // Cache constants
+        private const int ANALYSIS_CACHE_MINUTES = CacheConstants.ANALYSIS_CACHE_MINUTES;
+        private const int HISTORICAL_DATA_CACHE_MINUTES = 30; // Cache historical data for 30 minutes
+
+        // Timeout
+        private const int HTTP_TIMEOUT_SECONDS = TimeoutConstants.HTTP_TIMEOUT_SECONDS;
 
         public EnhancedMarketAnalysisService(
             IStockService stockService,
@@ -37,7 +48,8 @@ namespace StockNotificationApi.Services
             IAIService aiService,
             INewsService newsService,
             IHttpClientFactory httpClientFactory,
-            ILogger<EnhancedMarketAnalysisService> logger)
+            ILogger<EnhancedMarketAnalysisService> logger,
+            ICacheService cache)
         {
             _stockService = stockService ?? throw new ArgumentNullException(nameof(stockService));
             _stockListService = stockListService ?? throw new ArgumentNullException(nameof(stockListService));
@@ -45,61 +57,164 @@ namespace StockNotificationApi.Services
             _newsService = newsService ?? throw new ArgumentNullException(nameof(newsService));
             _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         }
 
         public async Task<EnhancedMarketAnalysis> AnalyzeMarketAsync()
         {
-            _logger.LogInformation("Starting enhanced market analysis...");
-
-            var analysis = InitializeAnalysis();
-
-            try
+            // Use cache for market analysis
+            return await _cache.GetOrSetAsync("enhanced_market_analysis", async () =>
             {
-                // Get categorized stocks directly from StockListService
-                var categories = await _stockListService.GetAllCategoriesAsync();
-                ValidateCategories(categories);
+                _logger.LogInformation("Cache miss for market analysis, starting enhanced market analysis...");
 
-                _logger.LogInformation("Categories - Large: {LargeCount}, Mid: {MidCount}, Small: {SmallCount}",
-                    categories["LargeCap"].Count, categories["MidCap"].Count, categories["SmallCap"].Count);
+                var analysis = InitializeAnalysis();
 
-                // Convert StockInfo to StockData for each category
-                var (largeCapStocks, midCapStocks, smallCapStocks) = await ConvertCategoriesToStockData(categories);
-                var categorized = (largeCapStocks, midCapStocks, smallCapStocks);
+                try
+                {
+                    // Get categorized stocks directly from StockListService
+                    var categories = await _stockListService.GetAllCategoriesAsync();
+                    ValidateCategories(categories);
 
-                // Gather additional data
-                var historicalData = await GetHistoricalDataAsync();
-                var recentNews = await _newsService.GetTopMarketNewsAsync(MAX_NEWS_ITEMS);
+                    _logger.LogInformation("Categories - Large: {LargeCount}, Mid: {MidCount}, Small: {SmallCount}",
+                        categories["LargeCap"].Count, categories["MidCap"].Count, categories["SmallCap"].Count);
 
-                // Get and parse AI analysis
-                analysis = await ProcessAIAnalysis(analysis, historicalData, categorized, recentNews);
+                    // ========== FIX: Use SINGLE bulk call instead of individual calls ==========
 
-                // Ensure we have market phase and sentiment
-                EnsureMarketPhaseAndSentiment(analysis, categorized);
+                    // First, collect all symbols from all categories
+                    var allSymbols = new List<string>();
+                    var symbolToCategory = new Dictionary<string, string>();
 
-                // Calculate dynamic confidence score
-                analysis.ConfidenceScore = CalculateConfidenceScore(categorized, analysis.MarketPhase, analysis.OverallSentiment);
-                _logger.LogInformation("Calculated confidence score: {Confidence}%", analysis.ConfidenceScore);
+                    foreach (var category in categories)
+                    {
+                        foreach (var stockInfo in category.Value.Take(MAX_STOCKS_PER_CATEGORY))
+                        {
+                            if (stockInfo?.Symbol != null)
+                            {
+                                var symbolWithExchange = $"{stockInfo.Symbol}.NS";
+                                allSymbols.Add(symbolWithExchange);
+                                symbolToCategory[symbolWithExchange] = category.Key;
+                            }
+                        }
+                    }
 
-                // Ensure we have enough picks per category
-                EnsureSufficientPicks(analysis, largeCapStocks, midCapStocks, smallCapStocks);
+                    _logger.LogInformation("Fetching data for {Count} stocks in a single bulk call", allSymbols.Count);
 
-                // Remove duplicates across categories
-                RemoveDuplicatePicks(analysis);
+                    // Make ONE bulk call to get all stock data
+                    var allStockData = await _stockService.GetMultipleQuotesAsync(allSymbols);
 
-                // Add technical indicators and enhanced news impact
-                analysis.TechnicalIndicators = await CalculateTechnicalIndicatorsAsync(categorized);
-                analysis.KeyNewsImpacts = await AnalyzeNewsImpact(recentNews, categorized);
+                    _logger.LogInformation("✅ Bulk fetch returned {Count} stock data entries", allStockData.Count);
 
-                _logger.LogInformation("Final analysis complete - Large: {LargeCount}, Mid: {MidCount}, Small: {SmallCount}",
-                    analysis.LargeCap.TopPicks.Count, analysis.MidCap.TopPicks.Count, analysis.SmallCap.TopPicks.Count);
-            }
-            catch (Exception ex)
+                    // Create a dictionary for quick lookup
+                    var stockDataDict = allStockData
+                        .Where(s => s != null)
+                        .ToDictionary(s => s.Symbol, s => s, StringComparer.OrdinalIgnoreCase);
+
+                    // Distribute to categories based on the dictionary
+                    var largeCapStocks = new List<StockData>();
+                    var midCapStocks = new List<StockData>();
+                    var smallCapStocks = new List<StockData>();
+
+                    foreach (var category in categories)
+                    {
+                        foreach (var stockInfo in category.Value.Take(MAX_STOCKS_PER_CATEGORY))
+                        {
+                            if (stockInfo?.Symbol != null && stockDataDict.TryGetValue(stockInfo.Symbol, out var stockData))
+                            {
+                                if (category.Key == "LargeCap")
+                                    largeCapStocks.Add(stockData);
+                                else if (category.Key == "MidCap")
+                                    midCapStocks.Add(stockData);
+                                else if (category.Key == "SmallCap")
+                                    smallCapStocks.Add(stockData);
+                            }
+                        }
+                    }
+
+                    var categorized = (largeCapStocks, midCapStocks, smallCapStocks);
+
+                    _logger.LogInformation("Categorized stocks - Large: {LargeCount}, Mid: {MidCount}, Small: {SmallCount}",
+                        largeCapStocks.Count, midCapStocks.Count, smallCapStocks.Count);
+
+                    // Gather additional data (cached)
+                    var historicalData = await GetCachedHistoricalDataAsync();
+                    var recentNews = await _newsService.GetTopMarketNewsAsync(MAX_NEWS_ITEMS);
+
+                    // Get and parse AI analysis
+                    analysis = await ProcessAIAnalysis(analysis, historicalData, categorized, recentNews);
+
+                    // Ensure we have market phase and sentiment
+                    EnsureMarketPhaseAndSentiment(analysis, categorized);
+
+                    // Calculate dynamic confidence score
+                    analysis.ConfidenceScore = CalculateConfidenceScore(categorized, analysis.MarketPhase, analysis.OverallSentiment);
+                    _logger.LogInformation("Calculated confidence score: {Confidence}%", analysis.ConfidenceScore);
+
+                    // Ensure we have enough picks per category
+                    EnsureSufficientPicks(analysis, largeCapStocks, midCapStocks, smallCapStocks);
+
+                    // Remove duplicates across categories
+                    RemoveDuplicatePicks(analysis);
+
+                    // Add technical indicators and enhanced news impact
+                    analysis.TechnicalIndicators = await CalculateTechnicalIndicatorsAsync(categorized);
+                    analysis.KeyNewsImpacts = await AnalyzeNewsImpact(recentNews, categorized);
+
+                    _logger.LogInformation("Final analysis complete - Large: {LargeCount}, Mid: {MidCount}, Small: {SmallCount}",
+                        analysis.LargeCap.TopPicks.Count, analysis.MidCap.TopPicks.Count, analysis.SmallCap.TopPicks.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error in enhanced market analysis");
+                    return GetFallbackAnalysis();
+                }
+
+                return analysis;
+            }, TimeSpan.FromMinutes(ANALYSIS_CACHE_MINUTES));
+        }
+
+        private async Task<List<DailyPerformance>> GetCachedHistoricalDataAsync()
+        {
+            return await _cache.GetOrSetAsync("historical_market_data", async () =>
             {
-                _logger.LogError(ex, "Error in enhanced market analysis");
-                return GetFallbackAnalysis();
-            }
+                _logger.LogInformation("Cache miss for historical data, fetching...");
+                return await GetHistoricalDataAsync();
+            }, TimeSpan.FromMinutes(HISTORICAL_DATA_CACHE_MINUTES));
+        }
 
-            return analysis;
+        public async Task<string> GenerateDetailedReportAsync()
+        {
+            var analysis = await AnalyzeMarketAsync();
+            return FormatAnalysisForTelegram(analysis);
+        }
+
+        public async Task<List<TopStockPick>> GetTopPicksByCategoryAsync(string category, int count = 5)
+        {
+            var analysis = await AnalyzeMarketAsync();
+
+            return category.ToLower() switch
+            {
+                "large" => analysis.LargeCap.TopPicks.Take(count).ToList(),
+                "mid" => analysis.MidCap.TopPicks.Take(count).ToList(),
+                "small" => analysis.SmallCap.TopPicks.Take(count).ToList(),
+                _ => analysis.LargeCap.TopPicks.Concat(analysis.MidCap.TopPicks)
+                                               .Concat(analysis.SmallCap.TopPicks)
+                                               .Take(count).ToList()
+            };
+        }
+
+        public async Task<Dictionary<string, object>> GetMarketTechnicalIndicatorsAsync()
+        {
+            var analysis = await AnalyzeMarketAsync();
+
+            return new Dictionary<string, object>
+            {
+                ["market_phase"] = analysis.MarketPhase ?? "Neutral",
+                ["sentiment"] = analysis.OverallSentiment ?? "Neutral",
+                ["confidence"] = analysis.ConfidenceScore,
+                ["rsi"] = analysis.TechnicalIndicators?.RSIStatus ?? "Neutral",
+                ["macd"] = analysis.TechnicalIndicators?.MACDSignal ?? "Neutral",
+                ["volume"] = analysis.TechnicalIndicators?.VolumeAnalysis ?? "Average"
+            };
         }
 
         #region Initialization and Validation
@@ -124,19 +239,6 @@ namespace StockNotificationApi.Services
 
             if (!categories.ContainsKey("LargeCap") || !categories.ContainsKey("MidCap") || !categories.ContainsKey("SmallCap"))
                 throw new InvalidOperationException("Categories missing required keys");
-        }
-
-        private async Task<(List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap)>
-            ConvertCategoriesToStockData(Dictionary<string, List<StockInfo>> categories)
-        {
-            var largeCapStocks = await ConvertToStockData(categories["LargeCap"].Take(MAX_STOCKS_PER_CATEGORY).ToList());
-            var midCapStocks = await ConvertToStockData(categories["MidCap"].Take(MAX_STOCKS_PER_CATEGORY).ToList());
-            var smallCapStocks = await ConvertToStockData(categories["SmallCap"].Take(MAX_STOCKS_PER_CATEGORY).ToList());
-
-            _logger.LogInformation("Converted - Large: {LargeCount}, Mid: {MidCount}, Small: {SmallCount}",
-                largeCapStocks.Count, midCapStocks.Count, smallCapStocks.Count);
-
-            return (largeCapStocks, midCapStocks, smallCapStocks);
         }
 
         #endregion
@@ -346,29 +448,14 @@ namespace StockNotificationApi.Services
             if (stockInfos == null || !stockInfos.Any())
                 return new List<StockData>();
 
-            var stockDataList = new List<StockData>();
+            var symbols = stockInfos.Where(s => s?.Symbol != null)
+                                    .Select(s => $"{s.Symbol}.NS")
+                                    .ToList();
 
-            foreach (var info in stockInfos)
-            {
-                try
-                {
-                    if (info?.Symbol == null) continue;
+            if (!symbols.Any()) return new List<StockData>();
 
-                    var stockData = await _stockService.GetStockDataAsync($"{info.Symbol}.NS");
-                    if (stockData != null)
-                    {
-                        stockDataList.Add(stockData);
-                    }
-
-                    await Task.Delay(API_RATE_LIMIT_DELAY_MS);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Error converting {Symbol} to StockData", info?.Symbol);
-                }
-            }
-
-            return stockDataList;
+            // Use bulk API call
+            return await _stockService.GetMultipleQuotesAsync(symbols);
         }
 
         private async Task<(List<StockData> LargeCap, List<StockData> MidCap, List<StockData> SmallCap)>
@@ -448,11 +535,9 @@ namespace StockNotificationApi.Services
             {
                 if (news?.Title != null)
                 {
-                    // Show full news headline with impact
                     var impactEmoji = GetImpactEmoji(news.Impact);
                     sb.AppendLine($"- {impactEmoji} {news.Title}");
 
-                    // Show affected stocks if any
                     if (news.AffectedStocks?.Any() == true)
                     {
                         sb.AppendLine($"  Affects: {string.Join(", ", news.AffectedStocks.Take(3))}");
@@ -499,7 +584,6 @@ SMALL_CAP PICKS (3 stocks):
 [Symbol3] | Target: [price] | Stop Loss: [price] | Confidence: [0-100] | Reason: [brief]");
         }
 
-        // Example implementation in your AIService
         public async Task<string> GetMarketInsightAsync(List<StockData> stocks)
         {
             if (stocks == null || !stocks.Any())
@@ -507,7 +591,6 @@ SMALL_CAP PICKS (3 stocks):
 
             var sb = new StringBuilder();
 
-            // Calculate market metrics
             var avgChange = stocks.Average(s => s.ChangePercent);
             var gainers = stocks.Count(s => s.ChangePercent > 0);
             var losers = stocks.Count(s => s.ChangePercent < 0);
@@ -523,7 +606,6 @@ SMALL_CAP PICKS (3 stocks):
             if (maxLoser != null)
                 sb.AppendLine($"Worst performer: {maxLoser.Symbol} ({maxLoser.ChangePercent:F2}%)");
 
-            // Add sentiment analysis
             if (avgChange > 1)
                 sb.AppendLine("Market sentiment: Strongly Bullish");
             else if ((double)avgChange > 0.5)
@@ -636,7 +718,6 @@ SMALL_CAP PICKS (3 stocks):
                     ParsePickPart(part, pick, stock);
                 }
 
-                // Set defaults if needed
                 if (pick.TargetPrice == 0) pick.TargetPrice = stock.Price * 1.08m;
                 if (pick.StopLoss == 0) pick.StopLoss = stock.Price * 0.95m;
                 if (pick.Confidence == 0) pick.Confidence = 80;
@@ -940,7 +1021,7 @@ SMALL_CAP PICKS (3 stocks):
 
         #endregion
 
-        #region News Impact - UPDATED to use enhanced NewsImpactAnalysis model
+        #region News Impact
 
         private async Task<List<NewsImpactAnalysis>> AnalyzeNewsImpact(
             List<StockNews> news,
@@ -954,13 +1035,12 @@ SMALL_CAP PICKS (3 stocks):
             {
                 if (item == null) continue;
 
-                // Create enhanced news impact analysis with full details
                 var impact = new NewsImpactAnalysis
                 {
-                    Headline = item.Title, // Keep FULL headline, no truncation
+                    Headline = item.Title,
                     Source = item.Source ?? "Unknown",
                     PublishedAt = item.PublishedAt,
-                    Impact = GetImpactWithEmoji(item), // Use enhanced impact with emoji
+                    Impact = GetImpactWithEmoji(item),
                     AffectedStocks = item.AffectedStocks ?? new List<string>(),
                     AffectedSectors = DetermineAffectedSectors(item, categorized),
                     Summary = GenerateSummary(item),
@@ -975,11 +1055,9 @@ SMALL_CAP PICKS (3 stocks):
 
         private string GetImpactWithEmoji(StockNews news)
         {
-            // Use the impact from news if available
             if (!string.IsNullOrEmpty(news.Impact))
                 return news.Impact;
 
-            // Otherwise determine based on sentiment
             return news.Sentiment?.ToLower() switch
             {
                 "positive" => "🟢 POSITIVE",
@@ -1021,7 +1099,6 @@ SMALL_CAP PICKS (3 stocks):
 
         private string GenerateSummary(StockNews news)
         {
-            // Create a brief summary from the title if no summary available
             if (!string.IsNullOrEmpty(news.Summary))
                 return news.Summary.Length > 150 ? news.Summary.Substring(0, 147) + "..." : news.Summary;
 
@@ -1047,29 +1124,59 @@ SMALL_CAP PICKS (3 stocks):
             {
                 var client = _httpClientFactory.CreateClient();
                 client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
-                client.Timeout = TimeSpan.FromSeconds(30);
+                client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
 
                 var url = $"https://query1.finance.yahoo.com/v8/finance/chart/^NSEI?range={days}d&interval=1d";
                 var response = await client.GetAsync(url);
 
                 if (response.IsSuccessStatusCode)
                 {
-                    // TODO: Parse actual historical data from Yahoo Finance
-                    // For now, use sample data
-                    for (int i = 0; i < days; i++)
+                    // Parse actual historical data
+                    var content = await response.Content.ReadAsStringAsync();
+                    using var jsonDoc = JsonDocument.Parse(content);
+                    var root = jsonDoc.RootElement;
+
+                    if (root.TryGetProperty("chart", out var chart) &&
+                        chart.TryGetProperty("result", out var result) &&
+                        result.GetArrayLength() > 0)
                     {
-                        historicalData.Add(new DailyPerformance
+                        var quotes = result[0];
+                        if (quotes.TryGetProperty("indicators", out var indicators) &&
+                            indicators.TryGetProperty("quote", out var quote) &&
+                            quote.GetArrayLength() > 0)
                         {
-                            Date = DateTime.Now.AddDays(-i),
-                            NiftyChange = new Random().Next(-2, 3),
-                            MarketSentiment = i % 2 == 0 ? "Bullish" : "Bearish"
-                        });
+                            var quoteData = quote[0];
+                            if (quoteData.TryGetProperty("close", out var closeArray) &&
+                                closeArray.GetArrayLength() > 0)
+                            {
+                                // Parse historical data
+                                for (int i = 0; i < Math.Min(days, closeArray.GetArrayLength()); i++)
+                                {
+                                    var close = closeArray[i].GetDecimal();
+                                    historicalData.Add(new DailyPerformance
+                                    {
+                                        Date = DateTime.Now.AddDays(-i),
+                                        NiftyChange = close
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error fetching historical data");
+                // Return sample data as fallback
+                for (int i = 0; i < days; i++)
+                {
+                    historicalData.Add(new DailyPerformance
+                    {
+                        Date = DateTime.Now.AddDays(-i),
+                        NiftyChange = new Random().Next(-2, 3),
+                        MarketSentiment = i % 2 == 0 ? "Bullish" : "Bearish"
+                    });
+                }
             }
 
             return historicalData;
@@ -1077,46 +1184,7 @@ SMALL_CAP PICKS (3 stocks):
 
         #endregion
 
-        #region Public Methods
-
-        public async Task<string> GenerateDetailedReportAsync()
-        {
-            var analysis = await AnalyzeMarketAsync();
-            return FormatAnalysisForTelegram(analysis);
-        }
-
-        public async Task<List<TopStockPick>> GetTopPicksByCategoryAsync(string category, int count = 5)
-        {
-            var analysis = await AnalyzeMarketAsync();
-
-            return category.ToLower() switch
-            {
-                "large" => analysis.LargeCap.TopPicks.Take(count).ToList(),
-                "mid" => analysis.MidCap.TopPicks.Take(count).ToList(),
-                "small" => analysis.SmallCap.TopPicks.Take(count).ToList(),
-                _ => analysis.LargeCap.TopPicks.Concat(analysis.MidCap.TopPicks)
-                                               .Concat(analysis.SmallCap.TopPicks)
-                                               .Take(count).ToList()
-            };
-        }
-
-        public async Task<Dictionary<string, object>> GetMarketTechnicalIndicatorsAsync()
-        {
-            var allStocks = await _stockService.GetIndianStockDataAsync();
-            var categorized = await CategorizeStocksAsync(allStocks);
-            var summary = await CalculateTechnicalIndicatorsAsync(categorized);
-
-            return new Dictionary<string, object>
-            {
-                ["rsi"] = summary.RSIStatus ?? "Neutral",
-                ["macd"] = summary.MACDSignal ?? "Neutral",
-                ["volume"] = summary.VolumeAnalysis ?? "Average"
-            };
-        }
-
-        #endregion
-
-        #region Formatting - UPDATED to show enhanced news
+        #region Formatting
 
         private string FormatAnalysisForTelegram(EnhancedMarketAnalysis analysis)
         {
@@ -1131,7 +1199,7 @@ SMALL_CAP PICKS (3 stocks):
 
             AppendSummarySection(sb);
             AppendPicksSection(sb, analysis);
-            AppendEnhancedNewsSection(sb, analysis); // New method with enhanced news
+            AppendEnhancedNewsSection(sb, analysis);
             AppendTechnicalSection(sb, analysis);
 
             sb.AppendLine("<i>Analysis based on last 10 days data and AI predictions</i>");
@@ -1204,22 +1272,18 @@ SMALL_CAP PICKS (3 stocks):
             {
                 if (news == null) continue;
 
-                // Show full headline with impact emoji
                 sb.AppendLine($"{GetImpactPrefix(news.Impact)} <b>{news.Headline}</b>");
 
-                // Show affected stocks if any
                 if (news.AffectedStocks?.Any() == true)
                 {
                     sb.AppendLine($"   📊 Affects: {string.Join(", ", news.AffectedStocks.Take(3))}");
                 }
 
-                // Show affected sectors if any
                 if (news.AffectedSectors?.Any() == true)
                 {
                     sb.AppendLine($"   🏭 Sectors: {string.Join(", ", news.AffectedSectors)}");
                 }
 
-                // Show source and time
                 sb.AppendLine($"   📅 {news.PublishedAt:HH:mm} | {news.Source}");
                 sb.AppendLine();
             }
@@ -1294,7 +1358,6 @@ SMALL_CAP PICKS (3 stocks):
                     return GenerateFallbackAnalysis();
                 }
 
-                // Get some stock data for context if needed
                 var stocks = await _stockService.GetIndianStockDataAsync();
                 if (stocks == null || !stocks.Any())
                 {
@@ -1302,7 +1365,6 @@ SMALL_CAP PICKS (3 stocks):
                     return GenerateFallbackAnalysis();
                 }
 
-                // Get AI insights with the stock data
                 var insight = await _aiService.GetMarketInsightAsync(stocks.Take(10).ToList());
 
                 if (string.IsNullOrEmpty(insight))

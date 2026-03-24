@@ -1,4 +1,5 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 
 namespace StockNotificationApi.Services
@@ -8,27 +9,41 @@ namespace StockNotificationApi.Services
         private readonly IEnhancedMarketAnalysisService _analysisService;
         private readonly IStockService _stockService;
         private readonly ILogger<TradingService> _logger;
+        private readonly ICacheService _cache; // Added
 
-        // Constants for validation
-        private const decimal MAX_REALISTIC_RETURN_PERCENT = 50m; // Cap at 50% for realistic trades
-        private const decimal MIN_STOP_LOSS_DISTANCE = 5m; // Minimum 5% stop loss
-        private const decimal MAX_STOP_LOSS_DISTANCE = 15m; // Maximum 15% stop loss
+        // Use constants from Constants.cs
+        private const decimal MAX_REALISTIC_RETURN_PERCENT = TradingConstants.MAX_REALISTIC_RETURN_PERCENT;
+        private const decimal MIN_STOP_LOSS_DISTANCE = TradingConstants.MIN_STOP_LOSS_DISTANCE;
+        private const decimal MAX_STOP_LOSS_DISTANCE = TradingConstants.MAX_STOP_LOSS_DISTANCE;
+
+        // Cache constants
+        private const int TRADES_CACHE_MINUTES = CacheConstants.TRADES_CACHE_MINUTES;
+        private const int TOP_TRADES_CACHE_MINUTES = CacheConstants.TOP_TRADES_CACHE_MINUTES;
+        private const int CATEGORY_TRADES_CACHE_MINUTES = CacheConstants.CATEGORY_TRADES_CACHE_MINUTES;
+
+        // Confidence
+        private const int MIN_CONFIDENCE = TradingConstants.MIN_CONFIDENCE;
 
         public TradingService(
             IEnhancedMarketAnalysisService analysisService,
             IStockService stockService,
-            ILogger<TradingService> logger)
+            ILogger<TradingService> logger,
+            ICacheService cache) // Added
         {
             _analysisService = analysisService ?? throw new ArgumentNullException(nameof(analysisService));
             _stockService = stockService ?? throw new ArgumentNullException(nameof(stockService));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         }
 
         public async Task<TradingDashboard> GetTodaysTradesAsync(int minConfidence = 70)
         {
-            try
+            // Use cache for trading dashboard - different cache key based on confidence
+            var cacheKey = $"trading_dashboard_{minConfidence}";
+
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
             {
-                _logger.LogInformation("Getting today's trades with min confidence {MinConfidence}", minConfidence);
+                _logger.LogInformation("Cache miss for today's trades with min confidence {MinConfidence}", minConfidence);
 
                 var analysis = await _analysisService.AnalyzeMarketAsync();
 
@@ -63,18 +78,18 @@ namespace StockNotificationApi.Services
                 };
 
                 return dashboard;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting today's trades");
-                return new TradingDashboard();
-            }
+            }, TimeSpan.FromMinutes(TRADES_CACHE_MINUTES));
         }
 
         public async Task<List<TradeItem>> GetTopTradesAsync(int count = 5)
         {
-            try
+            // Use cache for top trades - different cache key based on count
+            var cacheKey = $"top_trades_{count}";
+
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
             {
+                _logger.LogInformation("Cache miss for top {Count} trades", count);
+
                 var dashboard = await GetTodaysTradesAsync(60); // Lower threshold to get more picks
 
                 if (dashboard?.Trades == null || !dashboard.Trades.Any())
@@ -89,38 +104,41 @@ namespace StockNotificationApi.Services
                     .ThenByDescending(t => t.Confidence)       // 🔥 Then by confidence
                     .Take(count)
                     .ToList();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting top trades");
-                return new List<TradeItem>();
-            }
+            }, TimeSpan.FromMinutes(TOP_TRADES_CACHE_MINUTES));
         }
 
         public async Task<List<TradeItem>> GetTradesByCategoryAsync(string category, int minConfidence = 70)
         {
-            var analysis = await _analysisService.AnalyzeMarketAsync();
+            // Use cache for category trades
+            var cacheKey = $"trades_{category}_{minConfidence}";
 
-            List<TopStockPick> picks = category.ToLower() switch
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
             {
-                "large" => analysis.LargeCap.TopPicks,
-                "mid" => analysis.MidCap.TopPicks,
-                "small" => analysis.SmallCap.TopPicks,
-                _ => new List<TopStockPick>()
-            };
+                _logger.LogInformation("Cache miss for {Category} trades with min confidence {MinConfidence}", category, minConfidence);
 
-            var trades = new List<TradeItem>();
-            foreach (var pick in picks.Where(p => p.Confidence >= minConfidence))
-            {
-                var trade = await MapToTradeItemWithCurrentPrice(pick, category);
-                if (trade != null && IsValidTrade(trade))
-                    trades.Add(trade);
-            }
+                var analysis = await _analysisService.AnalyzeMarketAsync();
 
-            return trades
-                .OrderByDescending(t => t.RiskReward)      // 🔥 Sort by risk/reward first
-                .ThenByDescending(t => t.Confidence)       // 🔥 Then by confidence
-                .ToList();
+                List<TopStockPick> picks = category.ToLower() switch
+                {
+                    "large" => analysis.LargeCap.TopPicks,
+                    "mid" => analysis.MidCap.TopPicks,
+                    "small" => analysis.SmallCap.TopPicks,
+                    _ => new List<TopStockPick>()
+                };
+
+                var trades = new List<TradeItem>();
+                foreach (var pick in picks.Where(p => p.Confidence >= minConfidence))
+                {
+                    var trade = await MapToTradeItemWithCurrentPrice(pick, category);
+                    if (trade != null && IsValidTrade(trade))
+                        trades.Add(trade);
+                }
+
+                return trades
+                    .OrderByDescending(t => t.RiskReward)      // 🔥 Sort by risk/reward first
+                    .ThenByDescending(t => t.Confidence)       // 🔥 Then by confidence
+                    .ToList();
+            }, TimeSpan.FromMinutes(CATEGORY_TRADES_CACHE_MINUTES));
         }
 
         #region Private Helper Methods

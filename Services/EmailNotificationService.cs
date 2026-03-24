@@ -1,6 +1,7 @@
 ﻿using MailKit.Net.Smtp;
 using MailKit.Security;
 using MimeKit;
+using StockNotificationApi.Constants;
 using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Text;
@@ -13,10 +14,12 @@ namespace StockNotificationApi.Services
         private readonly ILogger<EmailNotificationService> _logger;
         private readonly EmailSettings _emailSettings;
 
-        // Constants
+        // Use constants from Constants.cs
         private const int SMTP_DEFAULT_PORT = 587;
-        private const int RATE_LIMIT_DELAY_MS = 1000;
+        private const int RATE_LIMIT_DELAY_MS = RateLimitConstants.RATE_LIMIT_DELAY_MS;
         private const int MAX_RECIPIENTS_PER_EMAIL = 50;
+        private const int MAX_RETRY_ATTEMPTS = TimeoutConstants.MAX_RETRY_ATTEMPTS;
+        private const int RETRY_DELAY_MS = TimeoutConstants.RETRY_DELAY_MS;
 
         public EmailNotificationService(
             IConfiguration configuration,
@@ -33,16 +36,16 @@ namespace StockNotificationApi.Services
 
         private void ValidateEmailSettings()
         {
-            if (string.IsNullOrEmpty(_emailSettings.SmtpServer))
+            if (string.IsNullOrWhiteSpace(_emailSettings.SmtpServer))
                 throw new InvalidOperationException("SMTP server not configured");
 
             if (_emailSettings.SmtpPort <= 0 || _emailSettings.SmtpPort > 65535)
                 _emailSettings.SmtpPort = SMTP_DEFAULT_PORT;
 
-            if (string.IsNullOrEmpty(_emailSettings.SenderEmail))
+            if (string.IsNullOrWhiteSpace(_emailSettings.SenderEmail))
                 throw new InvalidOperationException("Sender email not configured");
 
-            if (string.IsNullOrEmpty(_emailSettings.SenderPassword))
+            if (string.IsNullOrWhiteSpace(_emailSettings.SenderPassword))
                 throw new InvalidOperationException("Sender password not configured");
 
             if (_emailSettings.RecipientEmails == null || !_emailSettings.RecipientEmails.Any())
@@ -63,33 +66,26 @@ namespace StockNotificationApi.Services
                 return;
             }
 
+            var recipients = _emailSettings.RecipientEmails
+                .Where(r => !string.IsNullOrWhiteSpace(r))
+                .Select(r => r.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (!recipients.Any())
+            {
+                _logger.LogWarning("No valid recipients found after trimming");
+                return;
+            }
+
             var startTime = DateTime.UtcNow;
             _logger.LogInformation("Starting to send daily prediction report to {Count} recipients",
-                _emailSettings.RecipientEmails.Count);
+                recipients.Count);
 
             try
             {
-                using var message = new MimeMessage();
-                message.From.Add(new MailboxAddress("Stock Predictions", _emailSettings.SenderEmail));
-
-                // Add recipients in batches to avoid email client limitations
-                var recipientCount = 0;
-                foreach (var recipient in _emailSettings.RecipientEmails.Take(MAX_RECIPIENTS_PER_EMAIL))
-                {
-                    if (!string.IsNullOrEmpty(recipient))
-                    {
-                        message.To.Add(new MailboxAddress("", recipient.Trim()));
-                        recipientCount++;
-                    }
-                }
-
-                if (recipientCount == 0)
-                {
-                    _logger.LogWarning("No valid recipients found");
-                    return;
-                }
-
-                message.Subject = $"📈 Indian Stock Market Predictions - {report.Date:dd MMM yyyy}";
+                // Build common parts of the message
+                var subject = $"📈 Indian Stock Market Predictions - {report.Date:dd MMM yyyy}";
 
                 var bodyBuilder = new BodyBuilder
                 {
@@ -97,18 +93,43 @@ namespace StockNotificationApi.Services
                     TextBody = BuildTextEmailBody(report)
                 };
 
-                message.Body = bodyBuilder.ToMessageBody();
+                // Split into batches
+                var batches = recipients
+                    .Select((email, index) => new { email, index })
+                    .GroupBy(x => x.index / MAX_RECIPIENTS_PER_EMAIL)
+                    .Select(g => g.Select(x => x.email).ToList())
+                    .ToList();
 
-                using var client = new SmtpClient
+                var batchNumber = 0;
+                foreach (var batch in batches)
                 {
-                    Timeout = 30000 // 30 second timeout
-                };
+                    batchNumber++;
 
-                await SendWithRetryAsync(client, message);
+                    var message = new MimeMessage();
+                    message.From.Add(new MailboxAddress("Stock Predictions", _emailSettings.SenderEmail));
+                    foreach (var recipient in batch)
+                    {
+                        message.To.Add(new MailboxAddress(string.Empty, recipient));
+                    }
+
+                    message.Subject = subject;
+                    message.Body = bodyBuilder.ToMessageBody();
+
+                    _logger.LogInformation("Sending batch {BatchNumber}/{TotalBatches} with {RecipientCount} recipients",
+                        batchNumber, batches.Count, batch.Count);
+
+                    await SendWithRetryAsync(message);
+
+                    // rate limit between batches
+                    if (batchNumber < batches.Count)
+                    {
+                        await Task.Delay(RATE_LIMIT_DELAY_MS);
+                    }
+                }
 
                 var duration = DateTime.UtcNow - startTime;
                 _logger.LogInformation("Daily prediction report sent successfully to {Count} recipients in {Duration}ms",
-                    recipientCount, duration.TotalMilliseconds);
+                    recipients.Count, duration.TotalMilliseconds);
             }
             catch (Exception ex)
             {
@@ -132,7 +153,7 @@ namespace StockNotificationApi.Services
                 throw new InvalidOperationException("No recipients configured");
             }
 
-            var firstRecipient = _emailSettings.RecipientEmails.FirstOrDefault(r => !string.IsNullOrEmpty(r));
+            var firstRecipient = _emailSettings.RecipientEmails.FirstOrDefault(r => !string.IsNullOrEmpty(r))?.Trim();
             if (firstRecipient == null)
             {
                 _logger.LogError("No valid recipients found for test notification");
@@ -141,20 +162,14 @@ namespace StockNotificationApi.Services
 
             try
             {
-                using var mimeMessage = new MimeMessage();
+                var mimeMessage = new MimeMessage();
                 mimeMessage.From.Add(new MailboxAddress("Stock Notifications", _emailSettings.SenderEmail));
-                mimeMessage.To.Add(new MailboxAddress("", firstRecipient.Trim()));
+                mimeMessage.To.Add(new MailboxAddress(string.Empty, firstRecipient));
                 mimeMessage.Subject = "Test Notification";
                 mimeMessage.Body = new TextPart("plain") { Text = message };
 
-                using var client = new SmtpClient
-                {
-                    Timeout = 30000
-                };
-
-                await ConnectAndAuthenticateAsync(client);
-                await client.SendAsync(mimeMessage);
-                await client.DisconnectAsync(true);
+                // Use the same retry logic for the test message
+                await SendWithRetryAsync(mimeMessage);
 
                 _logger.LogInformation("Test notification sent successfully to {Recipient}", firstRecipient);
             }
@@ -165,52 +180,60 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task SendWithRetryAsync(SmtpClient client, MimeMessage message, int maxRetries = 3)
+        private async Task SendWithRetryAsync(MimeMessage message, int maxRetries = 3)
         {
-            int retryCount = 0;
-            while (retryCount < maxRetries)
+            if (message == null) throw new ArgumentNullException(nameof(message));
+
+            Exception? lastException = null;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
                 try
                 {
-                    await ConnectAndAuthenticateAsync(client);
+                    using var client = new SmtpClient
+                    {
+                        Timeout = TimeoutConstants.SMTP_TIMEOUT_MS // 30 second timeout
+                    };
+
+                    var socketOptions = GetSocketOptions();
+
+                    await client.ConnectAsync(_emailSettings.SmtpServer, _emailSettings.SmtpPort, socketOptions);
+                    _logger.LogDebug("Connected to SMTP server {Server}:{Port} (Attempt {Attempt})",
+                        _emailSettings.SmtpServer, _emailSettings.SmtpPort, attempt);
+
+                    await client.AuthenticateAsync(_emailSettings.SenderEmail, _emailSettings.SenderPassword);
+                    _logger.LogDebug("Authenticated with SMTP server (Attempt {Attempt})", attempt);
+
                     await client.SendAsync(message);
                     await client.DisconnectAsync(true);
+
+                    // Success
                     return;
                 }
-                catch (Exception ex) when (retryCount < maxRetries - 1)
+                catch (Exception ex) when (attempt < maxRetries)
                 {
-                    retryCount++;
-                    _logger.LogWarning(ex, "SMTP send failed (attempt {RetryCount}/{MaxRetries}), retrying...",
-                        retryCount + 1, maxRetries);
-                    await Task.Delay(RATE_LIMIT_DELAY_MS * retryCount); // Exponential backoff
-
-                    // Reset client state
-                    if (client.IsConnected)
-                    {
-                        await client.DisconnectAsync(true);
-                    }
+                    lastException = ex;
+                    _logger.LogWarning(ex, "SMTP send failed (attempt {Attempt}/{MaxRetries}), will retry...", attempt, maxRetries);
+                    await Task.Delay(RATE_LIMIT_DELAY_MS * attempt); // backoff
+                }
+                catch (Exception ex)
+                {
+                    // Last attempt failed
+                    lastException = ex;
+                    _logger.LogError(ex, "SMTP send failed on final attempt ({Attempt}/{MaxRetries})", attempt, maxRetries);
                 }
             }
+
+            // If we reach here, all attempts failed
+            throw new InvalidOperationException("Failed to send email after multiple attempts", lastException);
         }
 
-        private async Task ConnectAndAuthenticateAsync(SmtpClient client)
+        private SecureSocketOptions GetSocketOptions()
         {
-            if (!client.IsConnected)
-            {
-                await client.ConnectAsync(
-                    _emailSettings.SmtpServer,
-                    _emailSettings.SmtpPort,
-                    SecureSocketOptions.StartTls);
-
-                _logger.LogDebug("Connected to SMTP server {Server}:{Port}",
-                    _emailSettings.SmtpServer, _emailSettings.SmtpPort);
-            }
-
-            if (!client.IsAuthenticated)
-            {
-                await client.AuthenticateAsync(_emailSettings.SenderEmail, _emailSettings.SenderPassword);
-                _logger.LogDebug("Authenticated with SMTP server");
-            }
+            // If EnableSsl is true and port is 465, use SslOnConnect; otherwise use StartTls for TLS-enabled servers.
+            return _emailSettings.EnableSsl
+                ? (_emailSettings.SmtpPort == 465 ? SecureSocketOptions.SslOnConnect : SecureSocketOptions.StartTls)
+                : SecureSocketOptions.None;
         }
 
         private string BuildHtmlEmailBody(DailyPredictionReport report)

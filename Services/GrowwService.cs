@@ -1,4 +1,5 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 using System.Security.Cryptography;
 using System.Text;
@@ -18,12 +19,13 @@ namespace StockNotificationApi.Services
         private readonly SemaphoreSlim _authLock = new SemaphoreSlim(1, 1);
         private string _accessToken;
 
-        // Constants
-        private const string BASE_URL = "https://api.groww.in/";
-        private const string AUTH_ENDPOINT = "v1/trading/auth/token";
-        private const string ORDER_ENDPOINT = "v1/trading/order";
-        private const string QUOTE_ENDPOINT = "v1/market/quote";
-        private const string POSITIONS_ENDPOINT = "v1/trading/positions"; // Hypothetical endpoint
+        // Use constants from Constants.cs
+        private const string BASE_URL = EndpointConstants.GROWW_BASE_URL;
+        private const string AUTH_ENDPOINT = EndpointConstants.GROWW_AUTH_ENDPOINT;
+        private const string ORDER_ENDPOINT = EndpointConstants.GROWW_ORDER_ENDPOINT;
+        private const string QUOTE_ENDPOINT = EndpointConstants.GROWW_QUOTE_ENDPOINT;
+        private const string POSITIONS_ENDPOINT = EndpointConstants.GROWW_POSITIONS_ENDPOINT;
+        private const int HTTP_TIMEOUT_SECONDS = TimeoutConstants.HTTP_TIMEOUT_SECONDS;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="GrowwService"/> class.

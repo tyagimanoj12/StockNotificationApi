@@ -1,11 +1,13 @@
-﻿// Services/StockService.cs
-using Microsoft.Extensions.Primitives;
-using Newtonsoft.Json.Linq;
+﻿using Microsoft.Extensions.Primitives;
+using StockNotificationApi.Constants;
 using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
+using System.Collections.Concurrent;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using static StockNotificationApi.Services.MemoryCacheService;
 
 namespace StockNotificationApi.Services
 {
@@ -16,30 +18,75 @@ namespace StockNotificationApi.Services
         private readonly ILogger<StockService> _logger;
         private readonly StockApiSettings _stockApiSettings;
         private readonly IStockListService _stockListService;
-        private readonly ICacheService _cache; // Add this
+        private readonly ICacheService _cache;
+        private readonly IRequestCoalescer _requestCoalescer;
+        private readonly ICircuitBreakerService _circuitBreakerService;
+        private readonly INseApiService _nseApiService;
+        private readonly IGoogleFinanceService _googleFinance;
+        private readonly IMoneycontrolService _moneycontrol;
+        private readonly IAngelOneService _angelOneService;
 
-        // Constants
-        private const int RATE_LIMIT_DELAY_MS = 300;
-        private const int DEFAULT_STOCKS_PER_CATEGORY = 40;
-        private const decimal MARKET_CAP_DIVISOR = 10000000;
-        private const decimal YEAR_HIGH_MULTIPLIER = 1.2m;
-        private const decimal YEAR_LOW_MULTIPLIER = 0.8m;
-        private const decimal DAY_HIGH_MULTIPLIER = 1.02m;
-        private const decimal DAY_LOW_MULTIPLIER = 0.98m;
-        private const int HTTP_TIMEOUT_SECONDS = 30;
+        // Use constants from Constants.cs
+        private const int RATE_LIMIT_DELAY_MS = RateLimitConstants.API_RATE_LIMIT_DELAY_MS;
+        private const int DEFAULT_STOCKS_PER_CATEGORY = StockConstants.DEFAULT_STOCKS_PER_CATEGORY;
+        private const decimal MARKET_CAP_DIVISOR = StockConstants.MARKET_CAP_DIVISOR;
+        private const decimal YEAR_HIGH_MULTIPLIER = StockConstants.YEAR_HIGH_MULTIPLIER;
+        private const decimal YEAR_LOW_MULTIPLIER = StockConstants.YEAR_LOW_MULTIPLIER;
+        private const decimal DAY_HIGH_MULTIPLIER = StockConstants.DAY_HIGH_MULTIPLIER;
+        private const decimal DAY_LOW_MULTIPLIER = StockConstants.DAY_LOW_MULTIPLIER;
+        private const int HTTP_TIMEOUT_SECONDS = TimeoutConstants.HTTP_TIMEOUT_SECONDS;
+
+        // Cache constants
+        private const int ALL_STOCKS_CACHE_MINUTES = CacheConstants.ALL_STOCKS_CACHE_MINUTES;
+        private const int STOCK_DATA_CACHE_MINUTES = CacheConstants.STOCK_DATA_CACHE_MINUTES;
+
+        // Cache key prefixes
+        private const string CACHE_PREFIX_ALL_STOCKS = "all_stocks_data";
+        private const string CACHE_PREFIX_STOCK = "stock";
+        private const string CACHE_PREFIX_STOCK_PRICE = "stock_price";
+        private const string CACHE_PREFIX_FAILED_SYMBOL = "failed_symbol";
+
+        // Semaphore for concurrent operations
+        private static readonly SemaphoreSlim _fetchAllStocksLock = new(1, 1);
+        private static DateTime _lastFetchAttempt = DateTime.MinValue;
+        private static readonly TimeSpan MinimumFetchInterval = TimeSpan.FromSeconds(10);
+
+        // Cache for failed symbols to avoid repeated attempts
+        private static readonly ConcurrentDictionary<string, DateTime> _failedSymbols = new();
+        private static readonly TimeSpan FailedSymbolCacheTime = TimeSpan.FromMinutes(15);
+
+        // Track which APIs are currently failing
+        private static readonly ConcurrentDictionary<string, bool> _failingApis = new();
+
+        // Endpoints
+        private const string NSE_QUOTE_URL = EndpointConstants.NSE_QUOTE_URL;
+        private const string BSE_QUOTE_URL = EndpointConstants.BSE_QUOTE_URL;
+        private const string YAHOO_QUOTE_URL = EndpointConstants.YAHOO_QUOTE_URL;
 
         public StockService(
             IHttpClientFactory httpClientFactory,
             IConfiguration configuration,
             IStockListService stockListService,
-            ICacheService cache, // Add this
-            ILogger<StockService> logger)
+            ICacheService cache,
+            ILogger<StockService> logger,
+            IRequestCoalescer requestCoalescer,
+            ICircuitBreakerService circuitBreakerService,
+            INseApiService nseApiService,
+            IGoogleFinanceService googleFinance,
+            IMoneycontrolService moneycontrol,
+            IAngelOneService angelOneService)
         {
             _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
             _stockListService = stockListService ?? throw new ArgumentNullException(nameof(stockListService));
             _cache = cache ?? throw new ArgumentNullException(nameof(cache));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _requestCoalescer = requestCoalescer ?? throw new ArgumentNullException(nameof(requestCoalescer));
+            _circuitBreakerService = circuitBreakerService ?? throw new ArgumentNullException(nameof(circuitBreakerService));
+            _nseApiService = nseApiService ?? throw new ArgumentNullException(nameof(nseApiService));
+            _googleFinance = googleFinance ?? throw new ArgumentNullException(nameof(googleFinance));
+            _moneycontrol = moneycontrol ?? throw new ArgumentNullException(nameof(moneycontrol));
+            _angelOneService = angelOneService ?? throw new ArgumentNullException(nameof(angelOneService));
 
             _stockApiSettings = configuration.GetSection("StockApiSettings").Get<StockApiSettings>()
                 ?? throw new ArgumentNullException(nameof(configuration), "StockApiSettings not configured");
@@ -47,65 +94,311 @@ namespace StockNotificationApi.Services
 
         public async Task<List<StockData>> GetIndianStockDataAsync()
         {
-            return await _cache.GetOrSetAsync(
-                "all_stocks_data",
-                async () => await FetchAllStocksDataAsync(),
-                TimeSpan.FromMinutes(15)
-            ) ?? new List<StockData>();
+            return await _requestCoalescer.GetOrAddAsync(CACHE_PREFIX_ALL_STOCKS, async () =>
+            {
+                return await GetCachedAllStocksAsync();
+            });
         }
 
-        private async Task<List<StockData>> FetchAllStocksDataAsync()
+        private async Task<List<StockData>> GetCachedAllStocksAsync()
+        {
+            return await _cache.GetOrSetAsync(CACHE_PREFIX_ALL_STOCKS, async () =>
+            {
+                _logger.LogInformation("Cache miss for all stocks, fetching...");
+                return await FetchAllStocksDataAsync();
+            }, TimeSpan.FromMinutes(ALL_STOCKS_CACHE_MINUTES)) ?? new List<StockData>();
+        }
+
+        private async Task<List<StockData>> FetchAllStocksDataAsync(CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Fetching stocks for market analysis...");
 
+            await _fetchAllStocksLock.WaitAsync(cancellationToken);
             try
             {
-                // Get categories from StockListService
-                var categories = await _stockListService.GetAllCategoriesAsync();
-
-                var allStocks = new List<StockData>();
-
-                // Take top stocks from each category for balanced representation
-                var stocksToFetch = new List<StockInfo>();
-                stocksToFetch.AddRange(categories["LargeCap"].Take(DEFAULT_STOCKS_PER_CATEGORY));
-                stocksToFetch.AddRange(categories["MidCap"].Take(DEFAULT_STOCKS_PER_CATEGORY));
-                stocksToFetch.AddRange(categories["SmallCap"].Take(DEFAULT_STOCKS_PER_CATEGORY));
-
-                _logger.LogInformation("Fetching data for {Count} stocks...", stocksToFetch.Count);
-
-                foreach (var stock in stocksToFetch)
+                if (DateTime.UtcNow - _lastFetchAttempt < MinimumFetchInterval)
                 {
-                    try
+                    var cached = await _cache.GetAsync<List<StockData>>(CACHE_PREFIX_ALL_STOCKS);
+                    if (cached != null && cached.Any())
                     {
-                        if (stock?.Symbol == null) continue;
-
-                        var stockData = await GetStockDataAsync($"{stock.Symbol}.NS");
-                        if (stockData == null)
-                        {
-                            stockData = await GetStockDataAsync($"{stock.Symbol}.BO");
-                        }
-
-                        if (stockData != null)
-                        {
-                            allStocks.Add(stockData);
-                        }
-
-                        await Task.Delay(RATE_LIMIT_DELAY_MS);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error fetching data for {Symbol}", stock?.Symbol);
+                        _logger.LogDebug("Returning cached stocks due to rate limiting");
+                        return cached;
                     }
                 }
 
+                _lastFetchAttempt = DateTime.UtcNow;
+
+                var categories = await _stockListService.GetAllCategoriesAsync();
+
+                // Filter out ETF/MF symbols before fetching
+                var stocksToFetch = new List<StockInfo>();
+                foreach (var stock in categories["LargeCap"].Take(DEFAULT_STOCKS_PER_CATEGORY))
+                {
+                    if (!IsETFOrMutualFund(stock.Symbol))
+                        stocksToFetch.Add(stock);
+                }
+                foreach (var stock in categories["MidCap"].Take(DEFAULT_STOCKS_PER_CATEGORY))
+                {
+                    if (!IsETFOrMutualFund(stock.Symbol))
+                        stocksToFetch.Add(stock);
+                }
+                foreach (var stock in categories["SmallCap"].Take(DEFAULT_STOCKS_PER_CATEGORY))
+                {
+                    if (!IsETFOrMutualFund(stock.Symbol))
+                        stocksToFetch.Add(stock);
+                }
+
+                _logger.LogInformation("Fetching data for {Count} stocks (filtered from {Total} total)",
+                    stocksToFetch.Count, DEFAULT_STOCKS_PER_CATEGORY * 3);
+
+                var symbols = stocksToFetch.Select(s => $"{s.Symbol}.NS").ToList();
+
+                var stockDataMap = new Dictionary<string, StockData>();
+                var failedSymbols = new List<string>();
+
+                // Try Angel One bulk fetch
+                if (await _circuitBreakerService.IsApiAvailableAsync("AngelOne"))
+                {
+                    _logger.LogInformation("Attempting bulk fetch of {Count} stocks from Angel One", symbols.Count);
+
+                    try
+                    {
+                        var bulkStocks = await _circuitBreakerService.ExecuteAsync(
+                            "AngelOne",
+                            async () => await _angelOneService.GetMultipleQuotesAsync(symbols),
+                            new List<StockData>()
+                        );
+
+                        if (bulkStocks != null && bulkStocks.Any())
+                        {
+                            _logger.LogInformation("✅ Angel One bulk fetch successful for {Count} stocks", bulkStocks.Count);
+
+                            foreach (var stock in bulkStocks)
+                            {
+                                if (stock != null && !string.IsNullOrEmpty(stock.Symbol))
+                                {
+                                    stockDataMap[stock.Symbol] = stock;
+                                }
+                            }
+
+                            foreach (var symbol in symbols)
+                            {
+                                var cleanSymbol = symbol.Replace(".NS", "").Replace(".NSE", "");
+                                if (!stockDataMap.ContainsKey(symbol) && !stockDataMap.ContainsKey(cleanSymbol))
+                                {
+                                    failedSymbols.Add(symbol);
+                                }
+                            }
+
+                            _logger.LogInformation("Bulk fetch successful for {SuccessCount}/{TotalCount} stocks, {FailedCount} failed",
+                                stockDataMap.Count, symbols.Count, failedSymbols.Count);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Angel One bulk fetch returned no data");
+                            failedSymbols.AddRange(symbols);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Angel One bulk fetch failed");
+                        failedSymbols.AddRange(symbols);
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning("Angel One circuit breaker is open");
+                    failedSymbols.AddRange(symbols);
+                }
+
+                // Process failed symbols with better concurrency control
+                if (failedSymbols.Any())
+                {
+                    _logger.LogInformation("Fetching {Count} failed stocks individually with fallback", failedSymbols.Count);
+
+                    // Filter out recently failed symbols
+                    var symbolsToRetry = new List<string>();
+                    foreach (var symbol in failedSymbols)
+                    {
+                        var cleanSymbol = symbol.Replace(".NS", "").Replace(".NSE", "");
+                        if (!IsRecentlyFailed(cleanSymbol))
+                        {
+                            symbolsToRetry.Add(symbol);
+                        }
+                        else
+                        {
+                            _logger.LogDebug("Skipping recently failed symbol: {Symbol}", symbol);
+                        }
+                    }
+
+                    if (symbolsToRetry.Any())
+                    {
+                        using var semaphore = new SemaphoreSlim(3);
+                        var tasks = new List<Task>();
+                        var lockObj = new object();
+
+                        foreach (var symbol in symbolsToRetry)
+                        {
+                            if (cancellationToken.IsCancellationRequested)
+                                break;
+
+                            tasks.Add(Task.Run(async () =>
+                            {
+                                await semaphore.WaitAsync(cancellationToken);
+                                try
+                                {
+                                    var stockData = await FetchSingleStockWithFallbackAsync(symbol);
+                                    if (stockData != null)
+                                    {
+                                        lock (lockObj)
+                                        {
+                                            var cleanSymbol = stockData.Symbol;
+                                            if (!stockDataMap.ContainsKey(cleanSymbol))
+                                            {
+                                                stockDataMap[cleanSymbol] = stockData;
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogDebug(ex, "Error fetching data for {Symbol}", symbol);
+                                    MarkAsFailed(symbol);
+                                }
+                                finally
+                                {
+                                    semaphore.Release();
+                                }
+                            }, cancellationToken));
+                        }
+
+                        await Task.WhenAll(tasks);
+                    }
+                }
+
+                var allStocks = stockDataMap.Values.ToList();
                 _logger.LogInformation("Successfully fetched {Count} stocks", allStocks.Count);
                 return allStocks;
             }
-            catch (Exception ex)
+            finally
             {
-                _logger.LogError(ex, "Error in GetIndianStockDataAsync");
-                return new List<StockData>();
+                _fetchAllStocksLock.Release();
             }
+        }
+
+        private bool IsRecentlyFailed(string symbol)
+        {
+            if (_failedSymbols.TryGetValue(symbol, out var failedTime))
+            {
+                if (DateTime.UtcNow - failedTime < FailedSymbolCacheTime)
+                {
+                    return true;
+                }
+                _failedSymbols.TryRemove(symbol, out _);
+            }
+            return false;
+        }
+
+        private void MarkAsFailed(string symbol)
+        {
+            var cleanSymbol = symbol.Replace(".NS", "").Replace(".NSE", "").Replace(".BO", "").Trim();
+            _failedSymbols[cleanSymbol] = DateTime.UtcNow;
+        }
+
+        private async Task<StockData?> FetchSingleStockWithFallbackAsync(string symbol)
+        {
+            var cleanSymbol = symbol.Replace(".BSE", "").Replace(".NSE", "").Replace(".NS", "").Replace(".BO", "").Trim();
+
+            // Skip ETF/MF symbols
+            if (IsETFOrMutualFund(cleanSymbol))
+            {
+                _logger.LogDebug("Skipping ETF/Mutual Fund {Symbol}", cleanSymbol);
+                return null;
+            }
+
+            // Check if recently failed
+            if (IsRecentlyFailed(cleanSymbol))
+            {
+                _logger.LogDebug("Skipping recently failed symbol: {Symbol}", cleanSymbol);
+                return null;
+            }
+
+            _logger.LogDebug("Fetching {Symbol} with fallback", cleanSymbol);
+            StockData? stockData = null;
+
+            // TRY 1: Angel One (individual)
+            if (await _circuitBreakerService.IsApiAvailableAsync("AngelOne"))
+            {
+                try
+                {
+                    stockData = await _circuitBreakerService.ExecuteAsync(
+                        "AngelOne",
+                        async () => await _angelOneService.GetLiveQuoteAsync(cleanSymbol),
+                        null
+                    );
+                    if (stockData != null && stockData.Price > 0)
+                    {
+                        _logger.LogDebug("✅ Angel One successful for {Symbol}", cleanSymbol);
+                        return stockData;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Angel One failed for {Symbol}", cleanSymbol);
+                }
+            }
+
+            // TRY 2: Yahoo Finance (Most reliable fallback)
+            if (stockData == null && await _circuitBreakerService.IsApiAvailableAsync("Yahoo"))
+            {
+                try
+                {
+                    stockData = await _circuitBreakerService.ExecuteAsync(
+                        "Yahoo",
+                        async () => await GetFromYahooFinanceAsync(cleanSymbol),
+                        null
+                    );
+                    if (stockData != null && stockData.Price > 0)
+                    {
+                        _logger.LogDebug("✅ Yahoo Finance successful for {Symbol}", cleanSymbol);
+                        return stockData;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Yahoo Finance failed for {Symbol}", cleanSymbol);
+                }
+            }
+
+            // TRY 3: Google Finance (If Yahoo fails)
+            if (stockData == null && await _circuitBreakerService.IsApiAvailableAsync("GoogleFinance"))
+            {
+                try
+                {
+                    stockData = await _circuitBreakerService.ExecuteAsync(
+                        "GoogleFinance",
+                        async () => await _googleFinance.GetQuoteAsync(cleanSymbol),
+                        null
+                    );
+                    if (stockData != null && stockData.Price > 0)
+                    {
+                        _logger.LogDebug("✅ Google Finance successful for {Symbol}", cleanSymbol);
+                        return stockData;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Google Finance failed for {Symbol}", cleanSymbol);
+                }
+            }
+
+            // If all failed, mark as failed to avoid repeated attempts
+            if (stockData == null)
+            {
+                MarkAsFailed(cleanSymbol);
+            }
+
+            return stockData;
         }
 
         public async Task<StockData?> GetStockDataAsync(string symbol)
@@ -116,263 +409,190 @@ namespace StockNotificationApi.Services
                 return null;
             }
 
-            return await _cache.GetOrSetAsync(
-                $"stock:{symbol}",
-                async () => await FetchStockDataAsync(symbol),
-                TimeSpan.FromMinutes(5)
-            );
+            var cacheKey = GetCacheKey(CACHE_PREFIX_STOCK, symbol);
+
+            return await _cache.GetOrSetAsync(cacheKey, async () =>
+            {
+                return await FetchStockDataAsync(symbol);
+            }, TimeSpan.FromMinutes(STOCK_DATA_CACHE_MINUTES));
+        }
+
+        private string GetCacheKey(string prefix, params object[] parameters)
+        {
+            return $"{prefix}_{string.Join("_", parameters)}";
         }
 
         private async Task<StockData?> FetchStockDataAsync(string symbol)
         {
-            _logger.LogInformation("Fetching data for {Symbol} with fallback", symbol);
+            var cleanSymbol = symbol.Replace(".BSE", "").Replace(".NSE", "").Replace(".NS", "").Replace(".BO", "").Trim();
 
-            // Clean the symbol (remove any exchange suffixes)
-            var cleanSymbol = symbol.Replace(".BSE", "").Replace(".NSE", "").Replace(".NS", "").Replace(".BO", "");
+            // Skip ETF/MF symbols early
+            if (IsETFOrMutualFund(cleanSymbol))
+            {
+                _logger.LogDebug("Skipping ETF/Mutual Fund {Symbol}", cleanSymbol);
+                return null;
+            }
 
-            // Determine which exchanges to try based on the symbol suffix
-            var tryNSE = symbol.Contains(".NS") || symbol.Contains(".NSE") || !symbol.Contains(".BO");
-            var tryBSE = symbol.Contains(".BO") || symbol.Contains(".BSE") || !symbol.Contains(".NS");
-
+            _logger.LogDebug("Fetching data for {Symbol}", cleanSymbol);
             StockData? stockData = null;
 
-            // TRY 1: NSE API (if applicable)
-            if (tryNSE)
+            // PRIMARY: Angel One
+            if (await _circuitBreakerService.IsApiAvailableAsync("AngelOne"))
             {
-                _logger.LogInformation("Attempt 1: Trying NSE for {Symbol}", cleanSymbol);
-                stockData = await GetFromNSEAsync(cleanSymbol);
-                if (stockData != null)
+                try
                 {
-                    _logger.LogInformation("NSE successful for {Symbol}", cleanSymbol);
-                    return stockData;
-                }
-                _logger.LogWarning("NSE failed for {Symbol}, trying next source...", cleanSymbol);
-            }
-
-            // TRY 2: BSE API (if applicable)
-            if (tryBSE && stockData == null)
-            {
-                _logger.LogInformation("Attempt 2: Trying BSE for {Symbol}", cleanSymbol);
-                stockData = await GetFromBSEAsync(cleanSymbol);
-                if (stockData != null)
-                {
-                    _logger.LogInformation("BSE successful for {Symbol}", cleanSymbol);
-                    return stockData;
-                }
-                _logger.LogWarning("BSE failed for {Symbol}, trying next source...", cleanSymbol);
-            }
-
-            // TRY 3: Yahoo Finance (universal fallback)
-            if (stockData == null)
-            {
-                _logger.LogInformation("Attempt 3: Trying Yahoo Finance for {Symbol}", cleanSymbol);
-                stockData = await GetFromYahooFinanceAsync(cleanSymbol);
-                if (stockData != null)
-                {
-                    _logger.LogInformation("Yahoo Finance successful for {Symbol}", cleanSymbol);
-                    return stockData;
-                }
-            }
-
-            // TRY 4: Alpha Vantage (last resort)
-            if (stockData == null)
-            {
-                _logger.LogInformation("Attempt 4: Trying Alpha Vantage for {Symbol}", cleanSymbol);
-                stockData = await GetFromAlphaVantageAsync(symbol);
-                if (stockData != null)
-                {
-                    _logger.LogInformation("Alpha Vantage successful for {Symbol}", cleanSymbol);
-                    return stockData;
-                }
-            }
-
-            _logger.LogError("All data sources failed for {Symbol}", cleanSymbol);
-            return null;
-        }
-
-        // Rest of the methods remain the same...
-        // (Keep all the existing implementation methods: GetFromNSEAsync, MapNSEResponse, etc.)
-
-        #region NSE API Implementation
-
-        private async Task<StockData?> GetFromNSEAsync(string symbol)
-        {
-            try
-            {
-                var client = CreateHttpClient("https://www.nseindia.com");
-                var url = $"https://www.nseindia.com/api/quote-equity?symbol={symbol.ToUpper()}";
-
-                var response = await client.GetAsync(url);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var content = await response.Content.ReadAsStringAsync();
-
-                    var options = new JsonSerializerOptions
+                    stockData = await _circuitBreakerService.ExecuteAsync(
+                        "AngelOne",
+                        async () => await _angelOneService.GetLiveQuoteAsync(cleanSymbol),
+                        null
+                    );
+                    if (stockData != null && stockData.Price > 0)
                     {
-                        PropertyNameCaseInsensitive = true
-                    };
-
-                    var data = JsonSerializer.Deserialize<NSEQuoteResponse>(content, options);
-
-                    if (data?.PriceInfo != null)
-                    {
-                        return MapNSEResponse(data, symbol);
+                        _logger.LogDebug("✅ Angel One successful for {Symbol}", cleanSymbol);
+                        return stockData;
                     }
-
-                    _logger.LogWarning("NSE API returned but PriceInfo was null for {Symbol}", symbol);
                 }
-                else
+                catch (Exception ex)
                 {
-                    _logger.LogWarning("NSE API returned status {StatusCode} for {Symbol}", response.StatusCode, symbol);
+                    _logger.LogDebug(ex, "Angel One failed for {Symbol}", cleanSymbol);
                 }
             }
-            catch (Exception ex)
+
+            // SECONDARY: Yahoo Finance
+            if (stockData == null && await _circuitBreakerService.IsApiAvailableAsync("Yahoo"))
             {
-                _logger.LogWarning(ex, "NSE API failed for {Symbol}", symbol);
+                try
+                {
+                    stockData = await _circuitBreakerService.ExecuteAsync(
+                        "Yahoo",
+                        async () => await GetFromYahooFinanceAsync(cleanSymbol),
+                        null
+                    );
+                    if (stockData != null && stockData.Price > 0)
+                    {
+                        _logger.LogDebug("✅ Yahoo Finance successful for {Symbol}", cleanSymbol);
+                        return stockData;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Yahoo Finance failed for {Symbol}", cleanSymbol);
+                }
             }
+
+            // If all failed, return cached data if available
+            var cached = await _cache.GetAsync<StockData>(GetCacheKey(CACHE_PREFIX_STOCK, symbol));
+            if (cached != null)
+            {
+                _logger.LogDebug("Returning cached data for {Symbol}", symbol);
+                return cached;
+            }
+
             return null;
         }
 
-        private StockData MapNSEResponse(NSEQuoteResponse data, string symbol)
+        public async Task<List<StockData>> GetMultipleQuotesAsync(List<string> symbols)
         {
-            // Calculate market cap if issued size is available
-            decimal marketCap = 0;
-            if (data.SecurityInfo?.IssuedSize > 0)
+            if (symbols == null || !symbols.Any())
+                return new List<StockData>();
+
+            // Filter out ETF/MF symbols first
+            var filteredSymbols = symbols
+                .Where(s => !IsETFOrMutualFund(s.Replace(".NS", "").Replace(".NSE", "")))
+                .ToList();
+
+            _logger.LogInformation("Fetching quotes for {Count} symbols (filtered from {Total})",
+                filteredSymbols.Count, symbols.Count);
+
+            if (!filteredSymbols.Any())
+                return new List<StockData>();
+
+            // Use Angel One's bulk quote method
+            if (await _circuitBreakerService.IsApiAvailableAsync("AngelOne"))
             {
-                marketCap = (data.PriceInfo.LastPrice * data.SecurityInfo.IssuedSize.Value) / MARKET_CAP_DIVISOR;
+                try
+                {
+                    return await _circuitBreakerService.ExecuteAsync(
+                        "AngelOne",
+                        async () => await _angelOneService.GetMultipleQuotesAsync(filteredSymbols),
+                        new List<StockData>());
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Angel One bulk fetch failed");
+                }
             }
 
-            // Get day range
-            decimal dayHigh = data.PriceInfo.IntraDayHighLow?.Max ?? data.PriceInfo.LastPrice;
-            decimal dayLow = data.PriceInfo.IntraDayHighLow?.Min ?? data.PriceInfo.LastPrice;
+            // Fallback to individual fetches with concurrency limit
+            _logger.LogInformation("Falling back to individual fetches for {Count} symbols", filteredSymbols.Count);
 
-            // Get 52-week range
-            decimal yearHigh = data.PriceInfo.WeekHighLow?.Max ?? dayHigh * YEAR_HIGH_MULTIPLIER;
-            decimal yearLow = data.PriceInfo.WeekHighLow?.Min ?? dayLow * YEAR_LOW_MULTIPLIER;
-
-            // Parse timestamp
-            DateTime timestamp = ParseTimestamp(data.Metadata?.LastUpdateTime);
-
-            return new StockData
+            var results = new List<StockData>();
+            using var semaphore = new SemaphoreSlim(3);
+            var tasks = filteredSymbols.Select(async symbol =>
             {
-                Symbol = symbol,
-                Name = data.Info?.CompanyName ?? GetCompanyName(symbol),
-                Exchange = "NSE",
-                Price = data.PriceInfo.LastPrice,
-                Change = data.PriceInfo.Change,
-                ChangePercent = data.PriceInfo.PChange,
-                Open = data.PriceInfo.Open,
-                DayHigh = dayHigh,
-                DayLow = dayLow,
-                PreviousClose = data.PriceInfo.PreviousClose,
-                Volume = 0,
-                YearHigh = yearHigh,
-                YearLow = yearLow,
-                MarketCap = marketCap,
-                PE = data.Metadata?.PdSymbolPe,
-                Sector = data.IndustryInfo?.Sector ?? GetSector(symbol),
-                Industry = data.IndustryInfo?.Industry ?? GetIndustry(symbol),
-                Timestamp = timestamp,
-                Isin = data.Info?.Isin
-            };
-        }
-
-        #endregion
-
-        #region BSE API Implementation
-
-        private async Task<StockData?> GetFromBSEAsync(string symbol)
-        {
-            try
-            {
-                var scripCode = GetBSEScripCode(symbol);
-                if (string.IsNullOrEmpty(scripCode))
+                await semaphore.WaitAsync();
+                try
                 {
-                    _logger.LogDebug("No BSE scrip code mapping for {Symbol}", symbol);
-                    return null;
-                }
-
-                var client = CreateHttpClient("https://www.bseindia.com");
-                var url = $"https://api.bseindia.com/BseIndiaAPI/api/StockReachData/w?scripcode={scripCode}";
-
-                var response = await client.GetAsync(url);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var content = await response.Content.ReadAsStringAsync();
-
-                    if (!content.Contains("Error Code"))
+                    var data = await GetStockDataAsync(symbol);
+                    if (data != null)
                     {
-                        var options = new JsonSerializerOptions
+                        lock (results)
                         {
-                            PropertyNameCaseInsensitive = true
-                        };
-
-                        var data = JsonSerializer.Deserialize<BSEQuoteResponse>(content, options);
-
-                        if (data != null)
-                        {
-                            return MapBSEResponse(data, symbol);
+                            results.Add(data);
                         }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "BSE API failed for {Symbol}", symbol);
-            }
-            return null;
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+
+            await Task.WhenAll(tasks);
+            return results;
         }
 
-        private StockData MapBSEResponse(BSEQuoteResponse data, string symbol)
+        private bool IsETFOrMutualFund(string symbol)
         {
-            return new StockData
+            var etfPatterns = new[]
             {
-                Symbol = symbol,
-                Name = data.CompanyName ?? symbol,
-                Exchange = "BSE",
-                Price = data.CurrentPrice,
-                Change = data.Change,
-                ChangePercent = data.PercentChange,
-                Open = data.Open,
-                DayHigh = data.DayHigh,
-                DayLow = data.DayLow,
-                PreviousClose = data.PreviousClose,
-                Volume = data.Volume,
-                YearHigh = data.YearHigh,
-                YearLow = data.YearLow,
-                MarketCap = data.MarketCap / MARKET_CAP_DIVISOR,
-                PE = data.PE,
-                Timestamp = data.UpdatedAt == DateTime.MinValue ? DateTime.Now : data.UpdatedAt
-            };
-        }
-
-        private string GetBSEScripCode(string symbol)
-        {
-            var mapping = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["RELIANCE"] = "500325",
-                ["TCS"] = "532540",
-                ["HDFCBANK"] = "500180",
-                ["INFY"] = "500209",
-                ["ICICIBANK"] = "532174",
-                ["HINDUNILVR"] = "500696",
-                ["ITC"] = "500875",
-                ["SBIN"] = "500112",
-                ["BHARTIARTL"] = "532454",
-                ["KOTAKBANK"] = "500247",
-                ["LT"] = "500510",
-                ["ASIANPAINT"] = "500820",
-                ["MARUTI"] = "532500",
-                ["TATAMOTORS"] = "500570",
-                ["AXISBANK"] = "532155"
+                "INAV", "ETF", "BEES", "MF", "MUTUAL", "SM", "SG",
+                "GB", "ND", "NG", "NH", "Z6", "Z7", "BANKETF", "BANKIETF",
+                "JUNIORBEES", "LIQUIDBEES", "MON100", "NIFTYBEES", "NIFTYBETA",
+                "HDFCNIF100", "HDFCNIFIT", "ICICI5INAV", "MONQ50INAV", "DSPN50INAV",
+                "AXISILVER", "SILVERADD", "EBBETF0433", "GSEC10IETF", "QNIFTY",
+                "LOWVOL", "HDFCGROWTH", "MAM150INAV", "HSM250INAV"
             };
 
-            return mapping.TryGetValue(symbol, out var code) ? code : string.Empty;
+            var suffixPatterns = new[]
+            {
+                "-EQ", "-SG", "-GB", "-MF", "-SM", "-BE", "-IV", "-ND",
+                "-NG", "-NH", "-Z6", "-Z7", "-ST"
+            };
+
+            var upperSymbol = symbol.ToUpper();
+
+            if (etfPatterns.Any(p => upperSymbol.Contains(p)))
+                return true;
+
+            if (suffixPatterns.Any(p => upperSymbol.EndsWith(p)))
+                return true;
+
+            if (upperSymbol.Length > 5 && upperSymbol.Any(char.IsDigit) && !IsValidStockSymbol(upperSymbol))
+                return true;
+
+            return false;
         }
 
-        #endregion
+        private bool IsValidStockSymbol(string symbol)
+        {
+            var validStockPatterns = new[]
+            {
+                "63MOONS", "63", "MOONS", "20MICRONS", "3MINDIA", "5PAISA"
+            };
+
+            return validStockPatterns.Any(p => symbol.Contains(p, StringComparison.OrdinalIgnoreCase));
+        }
 
         #region Yahoo Finance Implementation
 
@@ -380,55 +600,65 @@ namespace StockNotificationApi.Services
         {
             try
             {
-                var client = CreateHttpClient();
-                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS?region=IN&lang=en-IN";
+                using var client = _httpClientFactory.CreateClient();
+                client.DefaultRequestHeaders.Clear();
+                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                client.DefaultRequestHeaders.Add("Accept", "application/json");
+                client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
+                client.Timeout = TimeSpan.FromSeconds(10);
 
+                var url = $"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS?region=IN&lang=en-IN";
                 var response = await client.GetAsync(url);
 
                 if (response.IsSuccessStatusCode)
                 {
                     var content = await response.Content.ReadAsStringAsync();
-                    var options = new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true
-                    };
 
-                    var data = JsonSerializer.Deserialize<YahooFinanceResponse>(content, options);
+                    if (string.IsNullOrWhiteSpace(content) || !content.TrimStart().StartsWith("{"))
+                        return null;
 
-                    var quote = data?.Chart?.Result?.FirstOrDefault()?.Meta;
-                    if (quote != null)
+                    using var document = JsonDocument.Parse(content);
+                    var root = document.RootElement;
+
+                    if (root.TryGetProperty("chart", out var chart) &&
+                        chart.TryGetProperty("result", out var result) &&
+                        result.GetArrayLength() > 0)
                     {
-                        return MapYahooResponse(quote, symbol);
+                        var firstResult = result[0];
+                        if (firstResult.TryGetProperty("meta", out var meta))
+                        {
+                            return MapYahooResponse(meta, symbol);
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Yahoo Finance failed for {Symbol}", symbol);
+                _logger.LogDebug(ex, "Yahoo Finance failed for {Symbol}", symbol);
             }
             return null;
         }
 
-        private StockData MapYahooResponse(YahooMeta quote, string symbol)
+        private StockData MapYahooResponse(JsonElement meta, string symbol)
         {
-            var price = quote.RegularMarketPrice ?? 0;
-            var prevClose = quote.PreviousClose ?? price;
+            var price = GetDecimalProperty(meta, "regularMarketPrice") ?? 0;
+            var prevClose = GetDecimalProperty(meta, "previousClose") ?? price;
             var change = price - prevClose;
             var changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
             return new StockData
             {
                 Symbol = symbol,
-                Name = symbol,
+                Name = GetStringProperty(meta, "symbol") ?? symbol,
                 Exchange = "NSE",
                 Price = price,
                 Change = change,
                 ChangePercent = changePercent,
-                DayHigh = quote.RegularMarketDayHigh ?? price * DAY_HIGH_MULTIPLIER,
-                DayLow = quote.RegularMarketDayLow ?? price * DAY_LOW_MULTIPLIER,
-                Open = quote.RegularMarketOpen ?? price,
+                DayHigh = GetDecimalProperty(meta, "regularMarketDayHigh") ?? price * DAY_HIGH_MULTIPLIER,
+                DayLow = GetDecimalProperty(meta, "regularMarketDayLow") ?? price * DAY_LOW_MULTIPLIER,
+                Open = GetDecimalProperty(meta, "regularMarketOpen") ?? price,
                 PreviousClose = prevClose,
-                Volume = quote.RegularMarketVolume ?? 0,
+                Volume = GetLongProperty(meta, "regularMarketVolume") ?? 0,
                 YearHigh = price * YEAR_HIGH_MULTIPLIER,
                 YearLow = price * YEAR_LOW_MULTIPLIER,
                 Timestamp = DateTime.Now
@@ -437,176 +667,61 @@ namespace StockNotificationApi.Services
 
         #endregion
 
-        #region Alpha Vantage Implementation
+        #region Helper Methods
 
-        private async Task<StockData?> GetFromAlphaVantageAsync(string symbol)
+        private decimal? GetDecimalProperty(JsonElement element, string propertyName)
         {
-            try
-            {
-                var client = CreateHttpClient();
-                var url = $"{_stockApiSettings.BaseUrl}?function=GLOBAL_QUOTE&symbol={symbol}&apikey={_stockApiSettings.AlphaVantageApiKey}";
-
-                var response = await client.GetAsync(url);
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    return null;
-                }
-
-                var content = await response.Content.ReadAsStringAsync();
-
-                // Check for rate limit
-                if (IsRateLimited(content))
-                {
-                    _logger.LogWarning("Alpha Vantage rate limit reached");
-                    return null;
-                }
-
-                var json = JObject.Parse(content);
-                var globalQuote = json["Global Quote"];
-
-                if (globalQuote == null || !globalQuote.HasValues)
-                {
-                    return null;
-                }
-
-                return MapAlphaVantageResponse(globalQuote, symbol);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Alpha Vantage failed for {Symbol}", symbol);
-                return null;
-            }
+            if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.Number)
+                return prop.GetDecimal();
+            return null;
         }
 
-        private bool IsRateLimited(string content)
+        private long? GetLongProperty(JsonElement element, string propertyName)
         {
-            return content.Contains("rate limit") || content.Contains("25 requests") || content.Contains("API key");
+            if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.Number)
+                return prop.GetInt64();
+            return null;
         }
 
-        private StockData MapAlphaVantageResponse(JToken globalQuote, string symbol)
+        private string? GetStringProperty(JsonElement element, string propertyName)
         {
-            // Parse change percent
-            var changePercentStr = globalQuote["10. change percent"]?.ToString().Replace("%", "") ?? "0";
-            decimal.TryParse(changePercentStr, out decimal changePercent);
-
-            decimal price = decimal.TryParse(globalQuote["05. price"]?.ToString(), out var p) ? p : 0;
-            var cleanSymbol = symbol.Replace(".BSE", "").Replace(".NSE", "");
-
-            return new StockData
-            {
-                Symbol = cleanSymbol,
-                Name = GetCompanyName(symbol),
-                Price = price,
-                Change = decimal.TryParse(globalQuote["09. change"]?.ToString(), out var change) ? change : 0,
-                ChangePercent = changePercent,
-                DayHigh = decimal.TryParse(globalQuote["03. high"]?.ToString(), out var high) ? high : 0,
-                DayLow = decimal.TryParse(globalQuote["04. low"]?.ToString(), out var low) ? low : 0,
-                Volume = long.TryParse(globalQuote["06. volume"]?.ToString(), out var volume) ? volume : 0,
-                Timestamp = DateTime.TryParse(globalQuote["07. latest trading day"]?.ToString(), out var timestamp) ? timestamp : DateTime.Now,
-                Exchange = symbol.Contains(".BSE") ? "BSE" : "NSE",
-                YearHigh = decimal.TryParse(globalQuote["03. high"]?.ToString(), out var yearHigh) ? yearHigh * YEAR_HIGH_MULTIPLIER : price * YEAR_HIGH_MULTIPLIER,
-                YearLow = decimal.TryParse(globalQuote["04. low"]?.ToString(), out var yearLow) ? yearLow * YEAR_LOW_MULTIPLIER : price * YEAR_LOW_MULTIPLIER,
-                Open = decimal.TryParse(globalQuote["02. open"]?.ToString(), out var open) ? open : price,
-                PreviousClose = decimal.TryParse(globalQuote["08. previous close"]?.ToString(), out var prevClose) ? prevClose : price,
-                MarketCap = 0,
-                Sector = GetSector(symbol),
-                Industry = GetIndustry(symbol)
-            };
+            if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.String)
+                return prop.GetString();
+            return null;
         }
 
         #endregion
 
-        #region Helper Methods
+        #region Public Utility Methods
 
-        private HttpClient CreateHttpClient(string? referer = null)
+        public void ClearCache()
         {
-            var client = _httpClientFactory.CreateClient();
-            client.DefaultRequestHeaders.Clear();
-            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-            client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-            client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
-
-            if (!string.IsNullOrEmpty(referer))
-            {
-                client.DefaultRequestHeaders.Add("Referer", referer);
-            }
-
-            client.Timeout = TimeSpan.FromSeconds(HTTP_TIMEOUT_SECONDS);
-
-            return client;
+            _cache.RemoveByPattern(CACHE_PREFIX_ALL_STOCKS);
+            _cache.RemoveByPattern(CACHE_PREFIX_STOCK);
+            _failedSymbols.Clear();
+            _logger.LogInformation("Cleared all stock cache");
         }
 
-        private DateTime ParseTimestamp(string? lastUpdateTime)
+        public async Task<CacheStatistics> GetCacheStatisticsAsync()
         {
-            if (string.IsNullOrEmpty(lastUpdateTime))
-                return DateTime.Now;
-
-            if (DateTime.TryParse(lastUpdateTime.Replace("-", " "), out var timestamp))
-                return timestamp;
-
-            return DateTime.Now;
+            return await Task.FromResult(_cache.GetStatistics());
         }
 
-        private string GetSector(string symbol)
-        {
-            var sectors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["RELIANCE"] = "Energy",
-                ["TCS"] = "Technology",
-                ["HDFCBANK"] = "Banking",
-                ["INFY"] = "Technology",
-                ["ICICIBANK"] = "Banking",
-                ["HINDUNILVR"] = "FMCG",
-                ["ITC"] = "FMCG",
-                ["SBIN"] = "Banking",
-                ["BHARTIARTL"] = "Telecom",
-                ["KOTAKBANK"] = "Banking"
-            };
+        #endregion
 
-            var key = symbol.Replace(".BSE", "").Replace(".NSE", "");
-            return sectors.TryGetValue(key, out var sector) ? sector : "Other";
-        }
+        #region Stub Methods (Keep for interface compliance, but not actively used)
 
-        private string GetIndustry(string symbol)
-        {
-            var industries = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["RELIANCE"] = "Oil & Gas",
-                ["TCS"] = "IT Services",
-                ["HDFCBANK"] = "Private Bank",
-                ["INFY"] = "IT Services",
-                ["ICICIBANK"] = "Private Bank",
-                ["HINDUNILVR"] = "Consumer Goods",
-                ["ITC"] = "Diversified",
-                ["SBIN"] = "Public Bank",
-                ["BHARTIARTL"] = "Telecom",
-                ["KOTAKBANK"] = "Private Bank"
-            };
+        private bool IsMarketHours() => false;
 
-            var key = symbol.Replace(".BSE", "").Replace(".NSE", "");
-            return industries.TryGetValue(key, out var industry) ? industry : "General";
-        }
+        private async Task<StockData?> GetFromNSEAsync(string symbol) => null;
 
-        private string GetCompanyName(string symbol)
-        {
-            var names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["RELIANCE"] = "Reliance Industries",
-                ["TCS"] = "Tata Consultancy Services",
-                ["HDFCBANK"] = "HDFC Bank",
-                ["INFY"] = "Infosys",
-                ["ICICIBANK"] = "ICICI Bank",
-                ["HINDUNILVR"] = "Hindustan Unilever",
-                ["ITC"] = "ITC Limited",
-                ["SBIN"] = "State Bank of India",
-                ["BHARTIARTL"] = "Bharti Airtel",
-                ["KOTAKBANK"] = "Kotak Mahindra Bank"
-            };
+        private async Task<StockData?> GetFromBSEAsync(string symbol) => null;
 
-            var key = symbol.Replace(".BSE", "").Replace(".NSE", "");
-            return names.TryGetValue(key, out var name) ? name : key;
-        }
+        private string GetSector(string symbol) => "Other";
+
+        private string GetIndustry(string symbol) => "General";
+
+        private string GetCompanyName(string symbol) => symbol;
 
         #endregion
     }

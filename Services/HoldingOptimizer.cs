@@ -1,4 +1,5 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
 
 namespace StockNotificationApi.Services
@@ -8,6 +9,13 @@ namespace StockNotificationApi.Services
         private readonly IAngelOneService _angelOneService;
         private readonly ITradingService _tradingService;
         private readonly ILogger<HoldingOptimizer> _logger;
+
+        // Use constants from Constants.cs
+        private const int MIN_CONFIDENCE = TradingConstants.MIN_CONFIDENCE;
+        private const decimal PROFIT_BOOKING_THRESHOLD = 10m;
+        private const decimal STOP_LOSS_THRESHOLD = -15m;
+        private const decimal PROFIT_TARGET_THRESHOLD = 20m;
+
 
         public HoldingOptimizer(
             IAngelOneService angelOneService,

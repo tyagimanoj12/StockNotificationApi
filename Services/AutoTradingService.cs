@@ -1,5 +1,7 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 using StockNotificationApi.Models;
+using System.Collections.Concurrent;
 
 namespace StockNotificationApi.Services
 {
@@ -8,32 +10,48 @@ namespace StockNotificationApi.Services
         private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<AutoTradingService> _logger;
         private readonly IConfiguration _configuration;
+        private readonly IServiceScopeFactory _scopeFactory; // ADD THIS
 
-        // Risk management constants
-        private const decimal MAX_POSITION_SIZE_PERCENT = 0.05m;
-        private const decimal MAX_DAILY_LOSS_PERCENT = 0.02m;
-        private const decimal MAX_PORTFOLIO_RISK = 0.10m;
-        private const int MAX_TRADES_PER_DAY = 5;
 
-        // In-memory trade tracking
-        private static readonly List<TradeExecution> _todayTrades = new();
-        private static readonly object _tradeLock = new();
+        // Use constants from Constants.cs
+        private const decimal MAX_POSITION_SIZE_PERCENT = TradingConstants.MAX_POSITION_SIZE_PERCENT;
+        private const decimal MAX_DAILY_LOSS_PERCENT = TradingConstants.MAX_DAILY_LOSS_PERCENT;
+        private const decimal MAX_PORTFOLIO_RISK = TradingConstants.MAX_PORTFOLIO_RISK;
+        private const int MAX_TRADES_PER_DAY = TradingConstants.MAX_TRADES_PER_DAY;
+
+        // Use ConcurrentBag for thread-safe collection
+        private static readonly ConcurrentBag<TradeExecution> _todayTrades = new();
+        private static readonly ConcurrentDictionary<string, TradeExecution> _activeTrades = new();
+        private static readonly SemaphoreSlim _tradeLock = new(1, 1);
+
+        // Track daily P&L
+        private static decimal _dailyPnL = 0;
+        private static DateTime _lastPnLReset = DateTime.UtcNow.Date;
+
+        // Cache for portfolio to avoid multiple fetches
+        private static PortfolioSummary? _cachedPortfolio;
+        private static DateTime _lastPortfolioFetch = DateTime.MinValue;
+        private static readonly TimeSpan PortfolioCacheDuration = TimeSpan.FromSeconds(30);
+
+        // Track daily loss limit
+        private static bool _dailyLossLimitHit = false;
 
         public AutoTradingService(
             IServiceProvider serviceProvider,
             ILogger<AutoTradingService> logger,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            IServiceScopeFactory scopeFactory)
         {
             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory)); ;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("Auto-Trading Service Started");
 
-            // Check if auto-trading is enabled in configuration
             var autoTradingEnabled = _configuration.GetValue<bool>("Trading:AutoTradingEnabled", false);
             if (!autoTradingEnabled)
             {
@@ -41,29 +59,44 @@ namespace StockNotificationApi.Services
                 return;
             }
 
-            // Wait for market open (9:15 AM)
+            // Start reset task with proper cancellation
+            _ = Task.Run(() => ResetDailyPnL(stoppingToken), stoppingToken);
+
             await WaitForMarketOpen(stoppingToken);
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    // Check if market is open
                     if (!IsMarketOpen())
                     {
                         await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
                         continue;
                     }
 
-                    // Create a scope for scoped services
+                    // Reset daily loss flag if new day
+                    if (_lastPnLReset.Date < DateTime.UtcNow.Date)
+                    {
+                        _dailyLossLimitHit = false;
+                    }
+
                     using (var scope = _serviceProvider.CreateScope())
                     {
                         var tradingService = scope.ServiceProvider.GetRequiredService<ITradingService>();
-                        var portfolioService = scope.ServiceProvider.GetRequiredService<IPortfolioService>();
                         var angelOneService = scope.ServiceProvider.GetRequiredService<IAngelOneService>();
-                        var growwService = scope.ServiceProvider.GetService<IGrowwService>();
 
-                        // Get today's trading signals
+                        // Fetch portfolio ONCE at the beginning of the loop
+                        var portfolio = await GetPortfolioWithCache(angelOneService);
+                        var holdings = portfolio?.Holdings ?? new List<Holding>();
+
+                        if (_dailyLossLimitHit || await HasExceededDailyLoss(portfolio))
+                        {
+                            _logger.LogWarning("Daily loss limit exceeded. Stopping trading for today.");
+                            _dailyLossLimitHit = true;
+                            await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
+                            continue;
+                        }
+
                         var dashboard = await tradingService.GetTodaysTradesAsync(minConfidence: 70);
 
                         if (dashboard?.Trades == null || !dashboard.Trades.Any())
@@ -73,39 +106,40 @@ namespace StockNotificationApi.Services
                             continue;
                         }
 
-                        // Get current portfolio
-                        var portfolio = await GetCombinedPortfolioValue(angelOneService);
-
-                        // Check daily loss limit
-                        if (await HasExceededDailyLoss(portfolio))
-                        {
-                            _logger.LogWarning("Daily loss limit exceeded. Stopping trading for today.");
-                            await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
-                            continue;
-                        }
-
-                        // Check trade count limit
                         var todayTradeCount = GetTodayTradeCount();
                         if (todayTradeCount >= MAX_TRADES_PER_DAY)
                         {
-                            _logger.LogInformation("Maximum trades per day ({Max}) reached. Stopping trading for today.", MAX_TRADES_PER_DAY);
+                            _logger.LogInformation("Maximum trades per day ({Max}) reached.", MAX_TRADES_PER_DAY);
                             await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
                             continue;
                         }
 
-                        // Process each trading signal (limit to remaining trades)
                         var remainingTrades = MAX_TRADES_PER_DAY - todayTradeCount;
                         foreach (var trade in dashboard.Trades.OrderByDescending(t => t.RiskReward).Take(remainingTrades))
                         {
-                            if (await ShouldTrade(trade, portfolio, angelOneService))
+                            // Check cancellation before each trade
+                            stoppingToken.ThrowIfCancellationRequested();
+
+                            // Update current price from Angel One for accuracy
+                            var liveQuote = await angelOneService.GetLiveQuoteAsync(trade.Symbol);
+                            if (liveQuote != null && liveQuote.Price > 0)
+                            {
+                                trade.CurrentPrice = liveQuote.Price;
+                            }
+
+                            if (await ShouldTrade(trade, portfolio, holdings, angelOneService))
                             {
                                 await ExecuteTrade(trade, portfolio, angelOneService);
                             }
                         }
                     }
 
-                    // Wait before next evaluation (every 15 minutes during market hours)
                     await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogInformation("Auto-trading service stopping gracefully");
+                    break;
                 }
                 catch (Exception ex)
                 {
@@ -113,54 +147,141 @@ namespace StockNotificationApi.Services
                     await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
                 }
             }
+
+            _logger.LogInformation("Auto-Trading Service stopped");
+        }
+
+        private async Task<PortfolioSummary> GetPortfolioWithCache(IAngelOneService angelOneService)
+        {
+            // Return cached portfolio if still valid
+            if (_cachedPortfolio != null && DateTime.UtcNow - _lastPortfolioFetch < PortfolioCacheDuration)
+            {
+                return _cachedPortfolio;
+            }
+
+            // Fetch fresh portfolio
+            try
+            {
+                _cachedPortfolio = await angelOneService.GetPortfolioAsync();
+                _lastPortfolioFetch = DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching portfolio");
+                _cachedPortfolio = null;
+            }
+
+            return _cachedPortfolio ?? new PortfolioSummary
+            {
+                CurrentValue = 0,
+                TotalInvestment = 0,
+                Holdings = new List<Holding>()
+            };
         }
 
         private int GetTodayTradeCount()
         {
-            lock (_tradeLock)
+            var today = DateTime.UtcNow.Date;
+            return _todayTrades.Count(t => t.ExecutedAt.Date == today);
+        }
+
+        private async Task ResetDailyPnL(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
             {
-                return _todayTrades.Count(t => t.ExecutedAt.Date == DateTime.UtcNow.Date);
+                try
+                {
+                    // Wait until midnight
+                    var now = DateTime.UtcNow;
+                    var midnight = now.Date.AddDays(1);
+                    var delay = midnight - now;
+
+                    try
+                    {
+                        await Task.Delay(delay, stoppingToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    stoppingToken.ThrowIfCancellationRequested();
+
+                    _logger.LogInformation("Resetting daily P&L...");
+
+                    // Reset static P&L
+                    await _tradeLock.WaitAsync(stoppingToken);
+                    try
+                    {
+                        _logger.LogInformation("Daily P&L reset: Yesterday's P&L was ₹{DailyPL:N2}", _dailyPnL);
+                        _dailyPnL = 0;
+                        _lastPnLReset = DateTime.UtcNow.Date;
+                        _dailyLossLimitHit = false;
+                    }
+                    finally
+                    {
+                        _tradeLock.Release();
+                    }
+
+                    // Clear today's trades
+                    while (_todayTrades.TryTake(out _)) { }
+
+                    _logger.LogInformation("Daily P&L reset completed");
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogInformation("P&L reset cancelled during shutdown");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error resetting daily P&L");
+                    // Wait before retrying on error
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
             }
         }
 
-        private async Task<bool> ShouldTrade(TradeItem trade, PortfolioSummary portfolio, IAngelOneService angelOneService)
+        private async Task<bool> ShouldTrade(TradeItem trade, PortfolioSummary portfolio, List<Holding> holdings, IAngelOneService angelOneService)
         {
             try
             {
-                // Check if we already have this position
-                if (await HasPosition(trade.Symbol, angelOneService))
+                // Use cached holdings instead of fetching again
+                if (holdings.Any(h => string.Equals(h.Symbol, trade.Symbol, StringComparison.OrdinalIgnoreCase)))
                 {
                     _logger.LogInformation("Already have position in {Symbol}, skipping", trade.Symbol);
                     return false;
                 }
 
-                // Calculate position size based on Kelly Criterion
                 var kellyFraction = CalculateKellyFraction(
                     trade.Confidence / 100m,
                     trade.RiskReward
                 );
 
-                // Apply position size limits
                 var maxPositionValue = portfolio.CurrentValue * MAX_POSITION_SIZE_PERCENT;
                 var kellyPositionValue = portfolio.CurrentValue * kellyFraction;
-
                 var positionSize = Math.Min(kellyPositionValue, maxPositionValue);
-
-                // Check if position is viable (minimum trade size)
                 var quantity = (int)(positionSize / trade.CurrentPrice);
+
                 if (quantity < 1)
                 {
                     _logger.LogDebug("Position size too small for {Symbol}", trade.Symbol);
                     return false;
                 }
 
-                // Check total portfolio risk
                 var totalRisk = portfolio.CurrentValue * MAX_PORTFOLIO_RISK;
                 var tradeRisk = quantity * (trade.CurrentPrice - trade.StopLoss);
 
                 if (tradeRisk > totalRisk)
                 {
-                    _logger.LogWarning("Trade risk {TradeRisk} exceeds portfolio limit {TotalRisk}",
+                    _logger.LogWarning("Trade risk {TradeRisk:C} exceeds portfolio limit {TotalRisk:C}",
                         tradeRisk, totalRisk);
                     return false;
                 }
@@ -178,7 +299,6 @@ namespace StockNotificationApi.Services
         {
             try
             {
-                // Calculate position size
                 var kellyFraction = CalculateKellyFraction(
                     trade.Confidence / 100m,
                     trade.RiskReward
@@ -196,7 +316,6 @@ namespace StockNotificationApi.Services
                 _logger.LogInformation("Executing trade: {Symbol} {Quantity} @ ₹{Price:F2}",
                     trade.Symbol, quantity, trade.CurrentPrice);
 
-                // Place order on primary broker (Angel One)
                 var order = new OrderRequest
                 {
                     Symbol = trade.Symbol,
@@ -214,10 +333,7 @@ namespace StockNotificationApi.Services
 
                 if (result.Status == "SUCCESS" || result.Status == "PLACED")
                 {
-                    // Record the trade
                     await RecordTrade(trade, quantity, result.OrderId);
-
-                    // Set stop loss
                     await PlaceStopLoss(trade.Symbol, quantity, trade.StopLoss, result.OrderId, angelOneService);
 
                     _logger.LogInformation("Trade executed successfully: Order {OrderId} for {Symbol}",
@@ -240,8 +356,6 @@ namespace StockNotificationApi.Services
             if (riskReward <= 0) return 0;
 
             var kelly = (winProb * (riskReward + 1) - 1) / riskReward;
-
-            // Conservative Kelly (use half-Kelly for safety)
             return Math.Max(0, Math.Min(kelly * 0.5m, MAX_POSITION_SIZE_PERCENT));
         }
 
@@ -258,27 +372,8 @@ namespace StockNotificationApi.Services
                     return;
                 }
 
-                var stopLossOrder = new OrderRequest
-                {
-                    Symbol = symbol,
-                    Action = "SELL",
-                    Quantity = quantity,
-                    Price = stopLoss,
-                    Exchange = "NSE",
-                    Variety = "STOPLOSS",
-                    OrderType = "SL",
-                    ProductType = "DELIVERY",
-                    Duration = "DAY"
-                };
-
-                // Uncomment when ready to place actual stop-loss orders
-                // var result = await angelOneService.PlaceOrderAsync(stopLossOrder);
-                // if (result.Status == "SUCCESS")
-                // {
-                //     _logger.LogInformation("Stop loss placed successfully for {Symbol}", symbol);
-                // }
-
-                _logger.LogInformation("Stop loss placement simulated for {Symbol} at ₹{StopLoss:F2} (Parent Order: {ParentOrderId})",
+                // In production, you would actually place the stop loss order
+                _logger.LogInformation("Stop loss would be placed for {Symbol} at ₹{StopLoss:F2} (Parent Order: {ParentOrderId})",
                     symbol, stopLoss, parentOrderId);
             }
             catch (Exception ex)
@@ -287,78 +382,28 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task<PortfolioSummary> GetCombinedPortfolioValue(IAngelOneService angelOneService)
-        {
-            try
-            {
-                var holdings = await angelOneService.GetHoldingsAsync();
-
-                if (holdings == null || !holdings.Any())
-                {
-                    return new PortfolioSummary
-                    {
-                        CurrentValue = 0,
-                        TotalInvestment = 0,
-                        Holdings = new List<Holding>()
-                    };
-                }
-
-                var currentValue = holdings.Sum(h => h.Quantity * h.CurrentPrice);
-                var totalInvestment = holdings.Sum(h => h.Quantity * h.AveragePrice);
-
-                _logger.LogInformation("Portfolio Value: ₹{CurrentValue:N2}, Investment: ₹{TotalInvestment:N2}, P&L: ₹{ProfitLoss:N2} ({Percent:F1}%)",
-                    currentValue, totalInvestment, currentValue - totalInvestment,
-                    totalInvestment > 0 ? ((currentValue - totalInvestment) / totalInvestment) * 100 : 0);
-
-                return new PortfolioSummary
-                {
-                    CurrentValue = currentValue,
-                    TotalInvestment = totalInvestment,
-                    Holdings = holdings,
-                    AsOfDate = DateTime.Now
-                };
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting combined portfolio value");
-                return new PortfolioSummary
-                {
-                    CurrentValue = 0,
-                    TotalInvestment = 0,
-                    Holdings = new List<Holding>()
-                };
-            }
-        }
-
-        private async Task<bool> HasPosition(string symbol, IAngelOneService angelOneService)
-        {
-            try
-            {
-                var holdings = await angelOneService.GetHoldingsAsync();
-                return holdings.Any(h => string.Equals(h.Symbol, symbol, StringComparison.OrdinalIgnoreCase));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error checking position for {Symbol}", symbol);
-                return false;
-            }
-        }
-
         private async Task<bool> HasExceededDailyLoss(PortfolioSummary portfolio)
         {
             try
             {
-                var dailyPL = await GetDailyProfitLoss();
-                var dailyLossLimit = portfolio.CurrentValue * MAX_DAILY_LOSS_PERCENT;
-
-                if (dailyPL < -dailyLossLimit)
+                await _tradeLock.WaitAsync();
+                try
                 {
-                    _logger.LogWarning("Daily loss limit exceeded. Daily P&L: ₹{DailyPL:N2}, Limit: ₹{Limit:N2}",
-                        dailyPL, dailyLossLimit);
-                    return true;
-                }
+                    var dailyLossLimit = portfolio.CurrentValue * MAX_DAILY_LOSS_PERCENT;
 
-                return false;
+                    if (_dailyPnL < -dailyLossLimit)
+                    {
+                        _logger.LogWarning("Daily loss limit exceeded. Daily P&L: ₹{DailyPL:N2}, Limit: ₹{Limit:N2}",
+                            _dailyPnL, dailyLossLimit);
+                        return true;
+                    }
+
+                    return false;
+                }
+                finally
+                {
+                    _tradeLock.Release();
+                }
             }
             catch (Exception ex)
             {
@@ -367,57 +412,46 @@ namespace StockNotificationApi.Services
             }
         }
 
-        private async Task<decimal> GetDailyProfitLoss()
-        {
-            lock (_tradeLock)
-            {
-                var today = DateTime.UtcNow.Date;
-                return _todayTrades
-                    .Where(t => t.ExecutedAt.Date == today)
-                    .Sum(t => t.ProfitLoss);
-            }
-        }
-
         private async Task RecordTrade(TradeItem trade, int quantity, string orderId)
         {
-            lock (_tradeLock)
+            var execution = new TradeExecution
             {
-                _todayTrades.Add(new TradeExecution
-                {
-                    Symbol = trade.Symbol,
-                    Action = "BUY",
-                    Quantity = quantity,
-                    Price = trade.CurrentPrice,
-                    Time = DateTime.Now,
-                    OrderId = orderId,
-                    ProfitLoss = 0
-                });
+                Symbol = trade.Symbol,
+                Action = "BUY",
+                Quantity = quantity,
+                Price = trade.CurrentPrice,
+                Time = DateTime.Now,
+                OrderId = orderId,
+                ProfitLoss = 0
+            };
 
-                _logger.LogInformation("Trade recorded: {Symbol} {Quantity} @ ₹{Price:F2} - Order ID: {OrderId}",
-                    trade.Symbol, quantity, trade.CurrentPrice, orderId);
-            }
+            _todayTrades.Add(execution);
+            _activeTrades.TryAdd(orderId, execution);
+
+            _logger.LogInformation("Trade recorded: {Symbol} {Quantity} @ ₹{Price:F2} - Order ID: {OrderId}",
+                trade.Symbol, quantity, trade.CurrentPrice, orderId);
 
             await Task.CompletedTask;
         }
 
-        public void UpdateTradeOnExit(string symbol, int quantity, decimal exitPrice)
+        public async Task UpdateTradeOnExit(string symbol, int quantity, decimal exitPrice, string orderId)
         {
-            lock (_tradeLock)
+            if (_activeTrades.TryGetValue(orderId, out var trade))
             {
-                var trades = _todayTrades
-                    .Where(t => t.Symbol == symbol && t.Action == "BUY" && t.ExitPrice == null)
-                    .OrderBy(t => t.Time)
-                    .Take(quantity)
-                    .ToList();
+                trade.ExitPrice = exitPrice;
+                trade.ExitedAt = DateTime.Now;
+                trade.ProfitLoss = (exitPrice - trade.Price) * trade.Quantity;
 
-                foreach (var trade in trades)
+                await _tradeLock.WaitAsync();
+                try
                 {
-                    trade.ExitPrice = exitPrice;
-                    trade.ExitedAt = DateTime.Now;
-                    trade.ProfitLoss = (exitPrice - trade.Price) * trade.Quantity;
-
-                    _logger.LogInformation("Trade exited: {Symbol} {Quantity} @ ₹{ExitPrice:F2}, P&L: ₹{ProfitLoss:F2}",
-                        trade.Symbol, trade.Quantity, exitPrice, trade.ProfitLoss);
+                    _dailyPnL += trade.ProfitLoss;
+                    _logger.LogInformation("Trade exited: {Symbol} {Quantity} @ ₹{ExitPrice:F2}, P&L: ₹{ProfitLoss:F2}, Daily P&L: ₹{DailyPL:F2}",
+                        symbol, quantity, exitPrice, trade.ProfitLoss, _dailyPnL);
+                }
+                finally
+                {
+                    _tradeLock.Release();
                 }
             }
         }
@@ -429,6 +463,7 @@ namespace StockNotificationApi.Services
             if (now.DayOfWeek < DayOfWeek.Monday || now.DayOfWeek > DayOfWeek.Friday)
                 return false;
 
+            // Market hours: 9:15 AM to 3:30 PM
             var marketOpen = new DateTime(now.Year, now.Month, now.Day, 9, 15, 0);
             var marketClose = new DateTime(now.Year, now.Month, now.Day, 15, 30, 0);
 
@@ -447,7 +482,33 @@ namespace StockNotificationApi.Services
                     break;
                 }
 
-                await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        public override async Task StopAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("Auto-Trading Service is stopping...");
+
+            try
+            {
+                await base.StopAsync(cancellationToken);
+                _logger.LogInformation("Auto-Trading Service stopped successfully");
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Auto-Trading Service stop was cancelled");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error stopping Auto-Trading Service");
             }
         }
     }

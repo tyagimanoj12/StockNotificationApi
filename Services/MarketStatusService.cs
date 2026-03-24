@@ -1,12 +1,13 @@
-﻿using StockNotificationApi.Interfaces;
+﻿using StockNotificationApi.Constants;
+using StockNotificationApi.Interfaces;
 
 namespace StockNotificationApi.Services
 {
     public class MarketStatusService : IMarketStatusService
     {
-        // Market hours: 9:15 AM to 3:30 PM IST (Indian Standard Time)
-        private readonly TimeSpan _marketOpenTime = new TimeSpan(9, 15, 0);
-        private readonly TimeSpan _marketCloseTime = new TimeSpan(15, 30, 0);
+        // Market hours from Constants.cs
+        private readonly TimeSpan _marketOpenTime = MarketConstants.MARKET_OPEN_TIME;
+        private readonly TimeSpan _marketCloseTime = MarketConstants.MARKET_CLOSE_TIME;
 
         // Market holidays for 2024 (add more as needed)
         private readonly HashSet<DateTime> _marketHolidays = new HashSet<DateTime>

@@ -54,8 +54,12 @@ namespace StockNotificationApi.Services
 
                 _logger.LogInformation("Retrieved data for {Count} stocks successfully", stockData.Count);
 
-                // Generate AI predictions
-                _logger.LogDebug("Generating AI predictions for {Count} stocks", stockData.Count);
+                // ========== FIX: Combine into ONE AI call ==========
+                // Generate predictions and market insight in a single call
+                _logger.LogDebug("Generating AI predictions and market insight for {Count} stocks", stockData.Count);
+
+                // The GeneratePredictionsAsync already returns a DailyPredictionReport with MarketSummary
+                // So we don't need a separate GetMarketInsightAsync call
                 var predictions = await _aiService.GeneratePredictionsAsync(stockData);
 
                 if (predictions == null)
@@ -64,9 +68,8 @@ namespace StockNotificationApi.Services
                     return;
                 }
 
-                // Get market insight
-                _logger.LogDebug("Fetching market insight");
-                predictions.MarketSummary = await _aiService.GetMarketInsightAsync(stockData);
+                // Note: MarketSummary is already populated by GeneratePredictionsAsync
+                // No need for a separate GetMarketInsightAsync call
 
                 // Send email notification
                 _logger.LogDebug("Sending daily prediction report");
@@ -78,9 +81,6 @@ namespace StockNotificationApi.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in daily stock prediction job after {Duration}", DateTime.UtcNow - jobStartTime);
-
-                // Optionally re-throw if you want Quartz to handle the error
-                // throw new JobExecutionException(ex, false);
             }
         }
     }
@@ -155,7 +155,7 @@ namespace StockNotificationApi.Services
             {
                 var logger = serviceProvider.GetRequiredService<ILogger<StockPredictionJobScheduler>>();
                 logger.LogError(ex, "Failed to schedule stock prediction job");
-                throw; // Re-throw to prevent application from starting with invalid schedule
+                throw;
             }
         }
 

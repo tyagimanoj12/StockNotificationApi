@@ -90,6 +90,62 @@ namespace StockNotificationApi.Controllers // Added namespace
             }
         }
 
+        // Add this to a test controller or as a debug command in TelegramBotService
+        /// <summary>
+        /// Tests Angel One market data connection
+        /// </summary>
+        [HttpGet("test-connection")]
+        [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        public async Task<IActionResult> TestAngelOneConnection()
+        {
+            try
+            {
+                _logger.LogInformation("Testing Angel One market data...");
+
+                var results = new List<string>();
+
+                // Test single quote
+                var reliance = await _angelOneService.GetLiveQuoteAsync("RELIANCE");
+                if (reliance != null)
+                {
+                    results.Add($"✅ Angel One quote successful: RELIANCE @ ₹{reliance.Price}");
+                }
+                else
+                {
+                    results.Add("❌ Angel One quote failed for RELIANCE");
+                }
+
+                // Test bulk quotes
+                var symbols = new List<string> { "TCS", "INFY", "HDFCBANK", "ICICIBANK" };
+                var quotes = await _angelOneService.GetMultipleQuotesAsync(symbols);
+                results.Add($"✅ Fetched {quotes.Count} quotes from Angel One");
+
+                // Test indices
+                var indices = await _angelOneService.GetIndicesAsync();
+                if (indices != null)
+                {
+                    results.Add($"✅ Indices: Nifty {indices.Nifty50?.Value}, Sensex {indices.Sensex?.Value}");
+                }
+                else
+                {
+                    results.Add("❌ Failed to fetch indices");
+                }
+
+                return Ok(new
+                {
+                    status = "Test completed",
+                    results = results,
+                    timestamp = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error testing Angel One connection");
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
         /// <summary>
         /// Gets daily profit and loss (realized and unrealized)
         /// </summary>
